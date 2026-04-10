@@ -1,0 +1,34 @@
+# ─── Terraform ───────────────────────────────
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
+terraform.tfvars.local
+
+# ─── Java / Maven ────────────────────────────
+target/
+*.jar
+*.war
+*.class
+
+# ─── Node / React ────────────────────────────
+node_modules/
+build/
+.env
+.env.local
+
+# ─── IDE ─────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# ─── Secrets ─────────────────────────────────
+*.pem
+*.key
+secrets/
+credentials
+
+# ─── infra.ps1 runtime files ─────────────────
+.jenkins-ebs-volume-id

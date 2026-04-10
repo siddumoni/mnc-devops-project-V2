@@ -1,0 +1,18 @@
+# ConfigMap — non-sensitive app config injected as environment variables.
+# DB_HOST is patched automatically by infra.ps1 after terraform apply outputs the RDS endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: dev
+  labels:
+    app: mnc-app
+    environment: dev
+data:
+  DB_HOST:                  "DB_HOST_PLACEHOLDER"   # patched by infra.ps1
+  DB_NAME:                  "mnc_app_dev"
+  DB_USERNAME:              "appuser"
+  SPRING_PROFILES_ACTIVE:   "dev"
+  DEPLOY_ENV:               "dev"
+  LOG_LEVEL:                "DEBUG"
+  JAVA_OPTS:                "-Xmx512m -Xms256m"

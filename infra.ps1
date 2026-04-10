@@ -1,0 +1,775 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# infra.ps1 — MNC App Lab Infrastructure Control Script
+#
+# Usage:
+#   .\infra.ps1 create     # First time OR after destroy
+#   .\infra.ps1 destroy    # Tear down expensive resources (preserves Jenkins EBS + ECR)
+#   .\infra.ps1 recreate   # destroy + create in one shot
+#   .\infra.ps1 status     # Show what is currently running
+#
+# What is PRESERVED across destroy/recreate:
+#   ✅ Jenkins EBS volume  (your plugins, credentials, jobs, SonarQube data)
+#   ✅ ECR repositories    (your built Docker images)
+#   ✅ S3 state bucket     (Terraform state)
+#   ✅ DynamoDB lock table
+#   ✅ EC2 key pair
+#
+# What is DESTROYED and recreated:
+#   🔄 EKS cluster + node group
+#   🔄 RDS MySQL instance
+#   🔄 VPC + subnets
+#   🔄 Jenkins EC2 (NEW EC2, SAME EBS — all config preserved)
+#   🔄 ALBs, security groups, IAM roles
+# ─────────────────────────────────────────────────────────────────────────────
+
+param([Parameter(Mandatory=$true)][ValidateSet("create","destroy","recreate","status")][string]$Action)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ── Constants ─────────────────────────────────────────────────────────────
+$AWS_REGION      = "ap-south-1"
+$PROJECT_NAME    = "mnc-app"
+$ENVIRONMENT     = "dev"
+$CLUSTER_NAME    = "$PROJECT_NAME-$ENVIRONMENT-cluster"
+$KEY_PAIR_NAME   = "$PROJECT_NAME-keypair"
+$LOCK_TABLE      = "terraform-state-lock"
+$DB_PASSWORD     = "LabPass123!"   # hardcoded for lab convenience
+$ENV_DIR         = "infra\environments\dev"
+$K8S_DIR         = "k8s\dev"
+
+# ── Colours ───────────────────────────────────────────────────────────────
+function Write-Step   { param($msg) Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
+function Write-OK     { param($msg) Write-Host "  ✅ $msg" -ForegroundColor Green }
+function Write-Warn   { param($msg) Write-Host "  ⚠️  $msg" -ForegroundColor Yellow }
+function Write-Fail   { param($msg) Write-Host "  ❌ $msg" -ForegroundColor Red }
+function Write-Info   { param($msg) Write-Host "  ℹ️  $msg" -ForegroundColor Gray }
+
+# ── Helper: run command and throw on failure ───────────────────────────────
+function Invoke-Cmd {
+    param([string]$cmd)
+    Write-Info "Running: $cmd"
+    Invoke-Expression $cmd
+    if ($LASTEXITCODE -ne 0) { throw "Command failed: $cmd" }
+}
+
+# ── Helper: wait with polling ─────────────────────────────────────────────
+function Wait-Until {
+    param([scriptblock]$Condition, [string]$Message, [int]$MaxSeconds = 600, [int]$IntervalSeconds = 15)
+    $elapsed = 0
+    while (-not (& $Condition)) {
+        if ($elapsed -ge $MaxSeconds) { throw "Timeout waiting for: $Message" }
+        Write-Info "Waiting for $Message... ($elapsed/$MaxSeconds s)"
+        Start-Sleep $IntervalSeconds
+        $elapsed += $IntervalSeconds
+    }
+    Write-OK $Message
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOOTSTRAP — runs automatically on first create
+# Creates S3 bucket, DynamoDB, key pair, patches tfvars
+# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-Bootstrap {
+    Write-Step "Bootstrap — one-time setup"
+
+    # Get account ID
+    $script:ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
+    Write-OK "Account ID: $ACCOUNT_ID"
+
+    $STATE_BUCKET = "$PROJECT_NAME-terraform-state-$ACCOUNT_ID"
+
+    # ── S3 state bucket ───────────────────────────────────────────────────
+    Write-Info "Checking S3 state bucket..."
+    $bucketCheck = aws s3api head-bucket --bucket $STATE_BUCKET 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Info "Creating S3 bucket: $STATE_BUCKET"
+        aws s3api create-bucket --bucket $STATE_BUCKET --region $AWS_REGION `
+            --create-bucket-configuration LocationConstraint=$AWS_REGION | Out-Null
+        aws s3api put-bucket-versioning --bucket $STATE_BUCKET `
+            --versioning-configuration Status=Enabled | Out-Null
+        $enc = '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+        aws s3api put-bucket-encryption --bucket $STATE_BUCKET `
+            --server-side-encryption-configuration $enc | Out-Null
+        aws s3api put-public-access-block --bucket $STATE_BUCKET `
+            --public-access-block-configuration `
+            "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" | Out-Null
+        Write-OK "S3 bucket created: $STATE_BUCKET"
+    } else {
+        Write-OK "S3 bucket already exists"
+    }
+
+    # ── DynamoDB ──────────────────────────────────────────────────────────
+    Write-Info "Checking DynamoDB lock table..."
+    $tableCheck = aws dynamodb describe-table --table-name $LOCK_TABLE --region $AWS_REGION 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        aws dynamodb create-table --table-name $LOCK_TABLE `
+            --attribute-definitions AttributeName=LockID,AttributeType=S `
+            --key-schema AttributeName=LockID,KeyType=HASH `
+            --billing-mode PAY_PER_REQUEST --region $AWS_REGION | Out-Null
+        Write-OK "DynamoDB table created"
+    } else {
+        Write-OK "DynamoDB table already exists"
+    }
+
+    # ── EC2 Key Pair ──────────────────────────────────────────────────────
+    Write-Info "Checking EC2 key pair..."
+    $keyCheck = aws ec2 describe-key-pairs --key-names $KEY_PAIR_NAME --region $AWS_REGION 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $keyPath = "$env:USERPROFILE\.ssh\$KEY_PAIR_NAME.pem"
+        $keyMaterial = aws ec2 create-key-pair --key-name $KEY_PAIR_NAME `
+            --region $AWS_REGION --query "KeyMaterial" --output text
+        $keyMaterial | Set-Content -Path $keyPath -NoNewline
+        Write-OK "Key pair created → $keyPath  (BACK THIS UP)"
+    } else {
+        Write-OK "Key pair already exists"
+    }
+
+    # ── Get latest Amazon Linux 2023 AMI ──────────────────────────────────
+    Write-Info "Getting latest Amazon Linux 2023 AMI..."
+    $AMI_ID = aws ec2 describe-images --owners amazon `
+        --filters "Name=name,Values=al2023-ami-2023*-x86_64" "Name=state,Values=available" `
+        --query "sort_by(Images, &CreationDate)[-1].ImageId" `
+        --output text --region $AWS_REGION
+    Write-OK "AMI ID: $AMI_ID"
+
+    # ── Patch tfvars and backend config ───────────────────────────────────
+    Write-Info "Patching tfvars and backend config with real values..."
+
+    # Patch terraform.tfvars
+    $tfvarsPath = "$ENV_DIR\terraform.tfvars"
+    $tfvars = Get-Content $tfvarsPath -Raw
+    $tfvars = $tfvars -replace "ACCOUNT_ID_PLACEHOLDER", $ACCOUNT_ID
+    $tfvars = $tfvars -replace "AMI_ID_PLACEHOLDER", $AMI_ID
+    Set-Content -Path $tfvarsPath -Value $tfvars -NoNewline
+    Write-OK "terraform.tfvars patched"
+
+    # Patch backend bucket in environments/dev/main.tf
+    $mainTfPath = "$ENV_DIR\main.tf"
+    $mainTf = Get-Content $mainTfPath -Raw
+    $mainTf = $mainTf -replace "mnc-app-terraform-state-ACCOUNT_ID_PLACEHOLDER", $STATE_BUCKET
+    Set-Content -Path $mainTfPath -Value $mainTf -NoNewline
+    Write-OK "Backend bucket patched in main.tf"
+
+    Write-OK "Bootstrap complete. State bucket: $STATE_BUCKET"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 1 — AWS infrastructure (VPC, Jenkins, ECR, EKS cluster, RDS)
+# Skips kubernetes_namespace because EKS does not exist yet
+# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-Pass1 {
+    Write-Step "Pass 1 — Creating AWS infrastructure"
+
+    Push-Location $ENV_DIR
+    try {
+        Write-Info "terraform init..."
+        terraform init -reconfigure | Out-Null
+        Write-OK "terraform init complete"
+
+        Write-Info "terraform apply Pass 1 (AWS resources only — skipping kubernetes_namespace)..."
+        terraform apply `
+            -target="module.dev.module.vpc" `
+            -target="module.dev.module.jenkins" `
+            -target="module.dev.module.ecr" `
+            -target="module.dev.module.eks" `
+            -target="module.dev.module.rds" `
+            -target="module.dev.aws_security_group.alb" `
+            -target="module.dev.aws_ssm_parameter.db_host" `
+            -target="module.dev.aws_ssm_parameter.db_name" `
+            -target="module.dev.aws_ssm_parameter.db_password" `
+            -target="module.dev.aws_ssm_parameter.ecr_registry" `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve
+
+        if ($LASTEXITCODE -ne 0) { throw "Pass 1 terraform apply failed" }
+        Write-OK "Pass 1 complete"
+    } finally {
+        Pop-Location
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WAIT FOR EKS — polls until cluster is ACTIVE and all nodes are Ready
+# Also waits for CoreDNS — required before any pods can be scheduled
+# ─────────────────────────────────────────────────────────────────────────────
+function Wait-ForEKS {
+    Write-Step "Waiting for EKS cluster and nodes to be ready"
+
+    # Update kubeconfig
+    aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME 2>&1 | Out-Null
+
+    # Wait for cluster ACTIVE
+    Wait-Until -Message "EKS cluster ACTIVE" -MaxSeconds 900 -IntervalSeconds 20 -Condition {
+        $status = aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION `
+            --query "cluster.status" --output text 2>&1
+        $status -eq "ACTIVE"
+    }
+
+    # Refresh kubeconfig after cluster is active
+    aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME 2>&1 | Out-Null
+
+    # Wait for nodes Ready
+    Wait-Until -Message "All EKS nodes Ready" -MaxSeconds 600 -IntervalSeconds 20 -Condition {
+        $notReady = kubectl get nodes --no-headers 2>&1 | Where-Object { $_ -notmatch "Ready" -and $_ -notmatch "^$" }
+        $allNodes = kubectl get nodes --no-headers 2>&1 | Where-Object { $_ -match "\S" }
+        ($allNodes.Count -gt 0) -and ($notReady.Count -eq 0)
+    }
+
+    # Wait for CoreDNS — this was the cause of stuck states in previous attempts
+    # kube-proxy and vpc-cni must be running before CoreDNS, and CoreDNS must be
+    # running before any application pods can resolve DNS (i.e. connect to RDS)
+    Write-Info "Waiting for CoreDNS pods to be Running..."
+    Wait-Until -Message "CoreDNS Running" -MaxSeconds 300 -IntervalSeconds 15 -Condition {
+        $coreDNS = kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>&1
+        $running = $coreDNS | Where-Object { $_ -match "Running" }
+        $running.Count -ge 1
+    }
+
+    Write-OK "EKS cluster, nodes, and CoreDNS all ready"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 2 — Create kubernetes_namespace (needs EKS to be healthy)
+# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-Pass2 {
+    Write-Step "Pass 2 — Creating Kubernetes namespace"
+
+    Push-Location $ENV_DIR
+    try {
+        terraform apply `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve
+
+        if ($LASTEXITCODE -ne 0) { throw "Pass 2 terraform apply failed" }
+        Write-OK "Pass 2 complete — kubernetes namespace created"
+    } finally {
+        Pop-Location
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALL ALB CONTROLLER — via Helm
+# Uses the IRSA role ARN from Terraform output (always correct after recreate)
+# ─────────────────────────────────────────────────────────────────────────────
+function Install-ALBController {
+    Write-Step "Installing AWS Load Balancer Controller"
+
+    Push-Location $ENV_DIR
+    try {
+        $ROLE_ARN = terraform output -raw alb_controller_role_arn
+        $VPC_ID   = terraform output -raw vpc_id
+    } finally {
+        Pop-Location
+    }
+
+    helm repo add eks https://aws.github.io/eks-charts 2>&1 | Out-Null
+    helm repo update | Out-Null
+
+    helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller `
+        --namespace kube-system `
+        --set clusterName=$CLUSTER_NAME `
+        --set serviceAccount.create=true `
+        --set serviceAccount.name=aws-load-balancer-controller `
+        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ROLE_ARN" `
+        --set region=$AWS_REGION `
+        --set vpcId=$VPC_ID `
+        --wait `
+        --timeout 5m
+
+    Write-OK "ALB Controller installed"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALL CLUSTER AUTOSCALER — via Helm
+# Enables min=1 / max=2 auto-scaling based on pod resource requests
+# ─────────────────────────────────────────────────────────────────────────────
+function Install-ClusterAutoscaler {
+    Write-Step "Installing Cluster Autoscaler"
+
+    helm repo add autoscaler https://kubernetes.github.io/autoscaler 2>&1 | Out-Null
+    helm repo update | Out-Null
+
+    helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler `
+        --namespace kube-system `
+        --set autoDiscovery.clusterName=$CLUSTER_NAME `
+        --set awsRegion=$AWS_REGION `
+        --set rbac.serviceAccount.create=true `
+        --set extraArgs.balance-similar-node-groups=true `
+        --set extraArgs.skip-nodes-with-system-pods=false `
+        --set extraArgs.scale-down-delay-after-add="5m" `
+        --set extraArgs.scale-down-unneeded-time="5m" `
+        --wait `
+        --timeout 3m
+
+    Write-OK "Cluster Autoscaler installed (min=1, max=2 — scales automatically)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATCH CONFIGMAP — inject real RDS endpoint into k8s/dev/configmap.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+function Update-ConfigMap {
+    Write-Step "Patching ConfigMap with real RDS endpoint"
+
+    Push-Location $ENV_DIR
+    try {
+        $RDS_HOST = terraform output -raw db_host
+    } finally {
+        Pop-Location
+    }
+
+    $cmPath = "$K8S_DIR\configmap.yaml"
+    $cm = Get-Content $cmPath -Raw
+    $cm = $cm -replace "DB_HOST_PLACEHOLDER", $RDS_HOST
+    $cm = $cm -replace '"mnc-app-dev-mysql\.[^"]*"', "`"$RDS_HOST`""
+    Set-Content -Path $cmPath -Value $cm -NoNewline
+
+    Write-OK "ConfigMap patched with RDS host: $RDS_HOST"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLY K8S MANIFESTS (non-deployment only)
+# Deployment YAMLs have placeholder image tags — Jenkins applies those
+# ─────────────────────────────────────────────────────────────────────────────
+function Apply-K8sManifests {
+    Write-Step "Applying Kubernetes manifests (non-deployment)"
+
+    # Inject DB secret from SSM
+    Write-Info "Injecting DB secret from SSM..."
+    $DB_PASS = aws ssm get-parameter `
+        --name "/$PROJECT_NAME/$ENVIRONMENT/db/password" `
+        --with-decryption --query "Parameter.Value" --output text --region $AWS_REGION
+
+    kubectl create secret generic app-db-secret `
+        "--from-literal=DB_PASSWORD=$DB_PASS" `
+        --namespace=$ENVIRONMENT `
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    Remove-Variable DB_PASS
+    Write-OK "DB secret injected"
+
+    # Apply non-deployment manifests
+    kubectl apply -f "$K8S_DIR\namespace.yaml"
+    kubectl apply -f "$K8S_DIR\configmap.yaml"
+    kubectl apply -f "$K8S_DIR\secret.yaml"
+    kubectl apply -f "$K8S_DIR\backend-service.yaml"
+    kubectl apply -f "$K8S_DIR\frontend-service.yaml"
+    kubectl apply -f "$K8S_DIR\ingress.yaml"
+
+    Write-OK "Manifests applied. Waiting for ALB to be provisioned (2-3 min)..."
+    Write-Info "Pods will come up after first Jenkins pipeline run (Step 9 in README)"
+
+    # Wait for ALB address to appear
+    $maxWait = 180
+    $elapsed = 0
+    while ($elapsed -lt $maxWait) {
+        $albAddr = kubectl get ingress app-ingress -n $ENVIRONMENT `
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>&1
+        if ($albAddr -and $albAddr -notmatch "Error" -and $albAddr.Length -gt 10) {
+            Write-OK "App ALB ready: http://$albAddr"
+            break
+        }
+        Start-Sleep 15
+        $elapsed += 15
+        Write-Info "ALB provisioning... ($elapsed/$maxWait s)"
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WAIT FOR JENKINS — polls until Jenkins HTTP 200
+# ─────────────────────────────────────────────────────────────────────────────
+function Wait-ForJenkins {
+    Write-Step "Waiting for Jenkins to be ready"
+
+    Push-Location $ENV_DIR
+    try {
+        $JENKINS_IP = terraform output -raw jenkins_public_ip
+    } finally {
+        Pop-Location
+    }
+
+    Write-Info "Jenkins EC2 public IP: $JENKINS_IP"
+    Write-Info "Userdata script takes 5-8 minutes on first run (installing Jenkins + SonarQube)..."
+    Write-Info "On recreate it loads from EBS — faster (~2 min)"
+
+    Wait-Until -Message "Jenkins responding on port 8080" -MaxSeconds 600 -IntervalSeconds 20 -Condition {
+        try {
+            $r = Invoke-WebRequest -Uri "http://$($JENKINS_IP):8080/login" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            $r.StatusCode -eq 200
+        } catch { $false }
+    }
+
+    # Get Jenkins initial password from SSM (only meaningful on fresh install)
+    Start-Sleep 10  # brief pause for SSM put-parameter to complete
+    $initPass = aws ssm get-parameter --name "/$PROJECT_NAME/jenkins/initial-password" `
+        --with-decryption --query "Parameter.Value" --output text --region $AWS_REGION 2>&1
+
+    Write-OK "Jenkins is up!"
+    Write-Host ""
+    Write-Host "  Jenkins URL  : http://$JENKINS_IP`:8080" -ForegroundColor White
+    Write-Host "  SonarQube URL: http://$JENKINS_IP`:9000"  -ForegroundColor White
+    if ($initPass -and $initPass -notmatch "ParameterNotFound") {
+        Write-Host "  Initial Password (fresh install only): $initPass" -ForegroundColor Yellow
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRINT SUMMARY — outputs all important URLs and next steps
+# ─────────────────────────────────────────────────────────────────────────────
+function Print-Summary {
+    Write-Step "Infrastructure ready"
+
+    Push-Location $ENV_DIR
+    try {
+        $JENKINS_IP  = terraform output -raw jenkins_public_ip
+        $JENKINS_ALB = terraform output -raw jenkins_alb_dns
+        $SONAR_URL   = terraform output -raw sonarqube_url
+        $ECR_URLS    = terraform output -json ecr_repository_urls | ConvertFrom-Json
+    } finally {
+        Pop-Location
+    }
+
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║  MNC App Lab — Infrastructure Ready                         ║" -ForegroundColor Cyan
+    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "║                                                              ║" -ForegroundColor Cyan
+    Write-Host "║  Jenkins  (direct) : http://$($JENKINS_IP):8080" -ForegroundColor White
+    Write-Host "║  Jenkins  (ALB)    : http://$JENKINS_ALB" -ForegroundColor White
+    Write-Host "║  SonarQube         : http://$($JENKINS_IP):9000" -ForegroundColor White
+    Write-Host "║                                                              ║" -ForegroundColor Cyan
+    Write-Host "║  ECR Backend  : $($ECR_URLS.backend)" -ForegroundColor White
+    Write-Host "║  ECR Frontend : $($ECR_URLS.frontend)" -ForegroundColor White
+    Write-Host "║                                                              ║" -ForegroundColor Cyan
+    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "║  NEXT STEPS                                                  ║" -ForegroundColor Cyan
+    Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "║                                                              ║" -ForegroundColor Cyan
+    Write-Host "║  1. Open Jenkins and configure (README Step 8)               ║" -ForegroundColor White
+    Write-Host "║  2. Run first pipeline (README Step 9) — pods come up here  ║" -ForegroundColor White
+    Write-Host "║  3. When done learning: .\infra.ps1 destroy                 ║" -ForegroundColor White
+    Write-Host "║  4. Next session      : .\infra.ps1 recreate                ║" -ForegroundColor White
+    Write-Host "║                                                              ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DESTROY — safe ordered teardown
+# Order matters: K8s resources → EKS → RDS → Jenkins EC2 → VPC
+# EBS volume is detached from Terraform state before destroy so it is preserved
+# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-Destroy {
+    Write-Step "Destroying infrastructure (preserving Jenkins EBS, ECR, S3, DynamoDB, Key Pair)"
+
+    Write-Warn "This will destroy EKS, RDS, Jenkins EC2, VPC and all associated resources."
+    Write-Warn "Jenkins EBS (your plugins/config/SonarQube data) will be PRESERVED."
+    $confirm = Read-Host "  Type 'yes' to continue"
+    if ($confirm -ne "yes") { Write-Info "Destroy cancelled."; return }
+
+    # ── Step 1: Delete Kubernetes resources first ──────────────────────────
+    # If we destroy EKS before deleting Ingress, the ALB Controller never gets
+    # a chance to delete the AWS ALB — it becomes an orphaned resource that
+    # blocks VPC deletion (ALBs hold ENIs in the VPC subnets).
+    Write-Step "Deleting Kubernetes resources (so ALB Controller can clean up ALBs)"
+
+    $kubeConfig = aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        # Delete ingress first — this tells the ALB Controller to delete the AWS ALB
+        kubectl delete ingress app-ingress -n $ENVIRONMENT --ignore-not-found=true 2>&1 | Out-Null
+        Write-Info "Ingress deleted — waiting for ALB to be removed by controller..."
+
+        # Wait for ALB to be fully deleted before proceeding
+        $albWait = 0
+        while ($albWait -lt 120) {
+            $albs = aws elbv2 describe-load-balancers --region $AWS_REGION `
+                --query "LoadBalancers[?contains(LoadBalancerName, '$PROJECT_NAME')].LoadBalancerName" `
+                --output text 2>&1
+            if (-not $albs -or $albs -match "None" -or $albs.Trim() -eq "") {
+                Write-OK "All app ALBs removed"
+                break
+            }
+            Write-Info "Waiting for ALB deletion... ($albWait/120 s) — $albs"
+            Start-Sleep 15
+            $albWait += 15
+        }
+
+        # Delete remaining K8s resources
+        kubectl delete -f "$K8S_DIR\backend-service.yaml"   --ignore-not-found=true 2>&1 | Out-Null
+        kubectl delete -f "$K8S_DIR\frontend-service.yaml"  --ignore-not-found=true 2>&1 | Out-Null
+        kubectl delete deployment backend frontend -n $ENVIRONMENT --ignore-not-found=true 2>&1 | Out-Null
+        kubectl delete namespace $ENVIRONMENT --ignore-not-found=true 2>&1 | Out-Null
+        Write-OK "Kubernetes resources cleaned up"
+    } else {
+        Write-Warn "Could not connect to EKS — may already be destroyed. Continuing..."
+    }
+
+    # ── Step 2: Remove EBS volume from Terraform state ─────────────────────
+    # This prevents terraform destroy from deleting the persistent EBS volume.
+    # The volume has prevent_destroy=true but we also remove it from state
+    # for extra safety.
+    Write-Step "Preserving Jenkins EBS volume (removing from Terraform state)"
+    Push-Location $ENV_DIR
+    try {
+        $ebsVolumeId = terraform output -raw jenkins_ebs_volume_id 2>&1
+        if ($LASTEXITCODE -eq 0 -and $ebsVolumeId -match "^vol-") {
+            Write-Info "Jenkins EBS volume ID: $ebsVolumeId"
+
+            # Remove volume attachment from state first, then the volume itself
+            terraform state rm "module.dev.module.jenkins.aws_volume_attachment.jenkins_home" 2>&1 | Out-Null
+            terraform state rm "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" 2>&1 | Out-Null
+            Write-OK "Jenkins EBS removed from Terraform state — volume $ebsVolumeId is preserved in AWS"
+
+            # Save volume ID to a local file so create can reattach it
+            $ebsVolumeId | Set-Content -Path "..\..\..\.jenkins-ebs-volume-id" -NoNewline
+            Write-OK "EBS volume ID saved to .jenkins-ebs-volume-id"
+        } else {
+            Write-Warn "Could not get EBS volume ID — it may have already been removed from state"
+        }
+    } catch {
+        Write-Warn "Error removing EBS from state: $_"
+    } finally {
+        Pop-Location
+    }
+
+    # ── Step 3: Terraform destroy (ordered targets) ────────────────────────
+    Write-Step "Running terraform destroy (ordered)"
+    Push-Location $ENV_DIR
+    try {
+        # Remove kubernetes_namespace from state first (cluster being destroyed)
+        terraform state rm "module.dev.kubernetes_namespace.env" 2>&1 | Out-Null
+
+        # Destroy EKS first (nodes drain cleanly before cluster is removed)
+        Write-Info "Destroying EKS..."
+        terraform destroy `
+            -target="module.dev.module.eks" `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve
+        Write-OK "EKS destroyed"
+
+        # Destroy RDS
+        Write-Info "Destroying RDS..."
+        terraform destroy `
+            -target="module.dev.module.rds" `
+            -target="module.dev.aws_ssm_parameter.db_host" `
+            -target="module.dev.aws_ssm_parameter.db_name" `
+            -target="module.dev.aws_ssm_parameter.db_password" `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve
+        Write-OK "RDS destroyed"
+
+        # Destroy Jenkins EC2 and ALB (EBS already removed from state — won't be touched)
+        Write-Info "Destroying Jenkins EC2 and ALB..."
+        terraform destroy `
+            -target="module.dev.module.jenkins" `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve
+        Write-OK "Jenkins EC2 destroyed (EBS preserved)"
+
+        # Destroy ECR SSM param
+        terraform destroy `
+            -target="module.dev.aws_ssm_parameter.ecr_registry" `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve 2>&1 | Out-Null
+
+        # Destroy VPC and ALB SG last (ENIs must be clear)
+        Write-Info "Destroying VPC..."
+        terraform destroy `
+            -target="module.dev.module.vpc" `
+            -target="module.dev.aws_security_group.alb" `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            -auto-approve
+        Write-OK "VPC destroyed"
+
+    } finally {
+        Pop-Location
+    }
+
+    Write-Host ""
+    Write-OK "Destroy complete!"
+    Write-Info "Preserved: Jenkins EBS volume, ECR repositories, S3 state bucket, DynamoDB, Key Pair"
+    Write-Info "To rebuild: .\infra.ps1 create"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REATTACH EBS — called during create after previous destroy
+# Imports the preserved EBS volume back into Terraform state
+# ─────────────────────────────────────────────────────────────────────────────
+function Reattach-EBS {
+    $ebsIdFile = ".jenkins-ebs-volume-id"
+    if (-not (Test-Path $ebsIdFile)) {
+        Write-Info "No saved EBS volume ID found — fresh install"
+        return
+    }
+
+    $ebsVolumeId = Get-Content $ebsIdFile -Raw
+    if (-not $ebsVolumeId -or -not ($ebsVolumeId -match "^vol-")) {
+        Write-Info "Invalid EBS volume ID in file — skipping reattach"
+        return
+    }
+
+    Write-Step "Reattaching preserved Jenkins EBS volume: $ebsVolumeId"
+
+    # Verify volume exists in AWS and is available
+    $volState = aws ec2 describe-volumes --volume-ids $ebsVolumeId `
+        --query "Volumes[0].State" --output text --region $AWS_REGION 2>&1
+
+    if ($volState -eq "available") {
+        Write-Info "EBS volume is available — will be attached to new Jenkins EC2"
+        Write-Info "Terraform will attach it via aws_volume_attachment resource"
+        Write-OK "EBS volume $ebsVolumeId ready for reattach"
+    } elseif ($volState -eq "in-use") {
+        Write-Warn "EBS volume is already in-use — may be attached to a previous instance"
+        Write-Info "If create fails on volume attachment, run: aws ec2 detach-volume --volume-id $ebsVolumeId --region $AWS_REGION"
+    } else {
+        Write-Warn "EBS volume state: $volState — proceeding anyway"
+    }
+
+    # Import the EBS volume back into Terraform state so Terraform manages it
+    Push-Location $ENV_DIR
+    try {
+        Write-Info "Importing EBS volume into Terraform state..."
+        terraform import `
+            -var-file="terraform.tfvars" `
+            -var="db_password=$DB_PASSWORD" `
+            "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" `
+            $ebsVolumeId 2>&1
+
+        Write-OK "EBS volume imported into Terraform state"
+    } catch {
+        Write-Warn "Import failed (may already be in state): $_"
+    } finally {
+        Pop-Location
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATUS — show current state of all resources
+# ─────────────────────────────────────────────────────────────────────────────
+function Show-Status {
+    Write-Step "Infrastructure Status"
+
+    # EKS
+    Write-Host "`n[ EKS Cluster ]" -ForegroundColor Cyan
+    $clusterStatus = aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION `
+        --query "cluster.status" --output text 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "Cluster: $CLUSTER_NAME — $clusterStatus"
+        aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME 2>&1 | Out-Null
+        kubectl get nodes 2>&1
+        Write-Host ""
+        Write-Host "Pods in dev namespace:" -ForegroundColor Gray
+        kubectl get pods -n dev 2>&1
+    } else {
+        Write-Warn "EKS cluster not found — infrastructure may be destroyed"
+    }
+
+    # Jenkins EC2
+    Write-Host "`n[ Jenkins EC2 ]" -ForegroundColor Cyan
+    $jenkins = aws ec2 describe-instances --region $AWS_REGION `
+        --filters "Name=tag:Name,Values=$PROJECT_NAME-jenkins-master" "Name=instance-state-name,Values=running" `
+        --query "Reservations[0].Instances[0].{State:State.Name,IP:PublicIpAddress,Type:InstanceType}" `
+        --output json 2>&1 | ConvertFrom-Json
+    if ($jenkins.State) {
+        Write-OK "Jenkins: $($jenkins.State) | $($jenkins.Type) | http://$($jenkins.IP):8080"
+    } else {
+        Write-Warn "Jenkins EC2 not running"
+    }
+
+    # Jenkins EBS
+    Write-Host "`n[ Jenkins EBS (persistent) ]" -ForegroundColor Cyan
+    $ebsIdFile = ".jenkins-ebs-volume-id"
+    if (Test-Path $ebsIdFile) {
+        $ebsId = Get-Content $ebsIdFile -Raw
+        $ebsState = aws ec2 describe-volumes --volume-ids $ebsId `
+            --query "Volumes[0].{State:State,Size:Size}" --output json --region $AWS_REGION 2>&1 | ConvertFrom-Json
+        if ($ebsState.State) {
+            Write-OK "EBS volume: $ebsId — $($ebsState.State) — $($ebsState.Size)GB"
+        }
+    } else {
+        Write-Info "No EBS volume ID on file (will be set after first create)"
+    }
+
+    # RDS
+    Write-Host "`n[ RDS MySQL ]" -ForegroundColor Cyan
+    $rds = aws rds describe-db-instances --region $AWS_REGION `
+        --db-instance-identifier "$PROJECT_NAME-$ENVIRONMENT-mysql" `
+        --query "DBInstances[0].{Status:DBInstanceStatus,Class:DBInstanceClass,Endpoint:Endpoint.Address}" `
+        --output json 2>&1 | ConvertFrom-Json
+    if ($rds.Status) {
+        Write-OK "RDS: $($rds.Status) | $($rds.Class) | $($rds.Endpoint)"
+    } else {
+        Write-Warn "RDS instance not found"
+    }
+
+    # ECR
+    Write-Host "`n[ ECR Repositories (always preserved) ]" -ForegroundColor Cyan
+    foreach ($repo in @("backend","frontend")) {
+        $images = aws ecr list-images --repository-name "$PROJECT_NAME/$repo" --region $AWS_REGION `
+            --query "length(imageIds)" --output text 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "$PROJECT_NAME/$repo — $images image(s)"
+        } else {
+            Write-Warn "$PROJECT_NAME/$repo — not found"
+        }
+    }
+
+    # Cost estimate
+    Write-Host "`n[ Rough Cost Estimate ]" -ForegroundColor Cyan
+    Write-Host "  When RUNNING (per hour):" -ForegroundColor Gray
+    Write-Host "    Jenkins t3.large     ~₹6.50/hr" -ForegroundColor Gray
+    Write-Host "    EKS control plane    ~₹8.50/hr" -ForegroundColor Gray
+    Write-Host "    EKS t3.small SPOT    ~₹0.75/hr" -ForegroundColor Gray
+    Write-Host "    RDS db.t3.micro      ~₹1.60/hr" -ForegroundColor Gray
+    Write-Host "    Total when running   ~₹17.35/hr" -ForegroundColor Yellow
+    Write-Host "  When DESTROYED:" -ForegroundColor Gray
+    Write-Host "    EBS 30GB gp3         ~₹0.14/hr (always)" -ForegroundColor Gray
+    Write-Host "    ECR storage          ~negligible" -ForegroundColor Gray
+    Write-Host "  2 hr/day learning = ~₹35/day = ~₹1,050/month" -ForegroundColor Green
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CREATE — full provision flow
+# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-Create {
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+    Write-Host "║  MNC App Lab — CREATE                                        ║" -ForegroundColor Green
+    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+
+    Invoke-Bootstrap
+    Reattach-EBS
+    Invoke-Pass1
+    Wait-ForEKS
+    Invoke-Pass2
+    Install-ALBController
+    Install-ClusterAutoscaler
+    Update-ConfigMap
+    Apply-K8sManifests
+    Wait-ForJenkins
+    Print-Summary
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN — dispatch based on action
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "MNC App Lab — infra.ps1 | Action: $Action" -ForegroundColor Magenta
+Write-Host "Region: $AWS_REGION | Project: $PROJECT_NAME | Environment: $ENVIRONMENT" -ForegroundColor Gray
+
+switch ($Action) {
+    "create"  { Invoke-Create }
+    "destroy" { Invoke-Destroy }
+    "recreate" {
+        Invoke-Destroy
+        Invoke-Create
+    }
+    "status"  { Show-Status }
+}

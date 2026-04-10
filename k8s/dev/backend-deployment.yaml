@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend Deployment — Dev Lab
+#
+# IMAGE PLACEHOLDERS: Jenkins pipeline replaces ECR_REGISTRY_PLACEHOLDER and
+# IMAGE_TAG_PLACEHOLDER using sed before kubectl apply. Never apply this file
+# directly — always trigger via the Jenkins pipeline (Step 9 in README).
+#
+# MNC Production differences:
+#   - Prod uses 3 replicas with REQUIRED pod anti-affinity across nodes
+#   - Prod has HorizontalPodAutoscaler (HPA) and PodDisruptionBudget (PDB)
+#   - Prod uses ON_DEMAND nodes (never SPOT for production workloads)
+#   - Prod has larger resource limits (500m CPU / 1Gi RAM)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: dev
+  labels:
+    app: backend
+    environment: dev
+    version: IMAGE_TAG_PLACEHOLDER
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+      environment: dev
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: backend
+        environment: dev
+        version: IMAGE_TAG_PLACEHOLDER
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: backend
+          image: ECR_REGISTRY_PLACEHOLDER/mnc-app/backend:IMAGE_TAG_PLACEHOLDER
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "768Mi"
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-db-secret
+                  key: DB_PASSWORD
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            failureThreshold: 12
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
