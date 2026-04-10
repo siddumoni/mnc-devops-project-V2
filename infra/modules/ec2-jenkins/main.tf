@@ -37,9 +37,9 @@ resource "aws_iam_policy" "jenkins" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ECRAuth"
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken"]
+        Sid      = "ECRAuth"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
       {
@@ -91,9 +91,9 @@ resource "aws_iam_policy" "jenkins" {
         Resource = "*"
       },
       {
-        Sid    = "STS"
-        Effect = "Allow"
-        Action = ["sts:GetCallerIdentity"]
+        Sid      = "STS"
+        Effect   = "Allow"
+        Action   = ["sts:GetCallerIdentity"]
         Resource = "*"
       }
     ]
@@ -196,7 +196,7 @@ resource "aws_security_group" "jenkins_alb" {
 # all live here and survive every destroy/recreate cycle.
 resource "aws_ebs_volume" "jenkins_home" {
   availability_zone = var.availability_zone
-  size              = 30   # GB — Jenkins home + SonarQube data + Maven cache
+  size              = 30 # GB — Jenkins home + SonarQube data + Maven cache
   type              = "gp3"
   encrypted         = true
 
@@ -216,9 +216,9 @@ resource "aws_ebs_volume" "jenkins_home" {
 }
 
 resource "aws_volume_attachment" "jenkins_home" {
-  device_name  = "/dev/xvdf"
-  volume_id    = aws_ebs_volume.jenkins_home.id
-  instance_id  = aws_instance.jenkins.id
+  device_name = "/dev/xvdf"
+  volume_id   = aws_ebs_volume.jenkins_home.id
+  instance_id = aws_instance.jenkins.id
   # Skip destroy on volume attachment — infra.ps1 handles detach manually
   skip_destroy = true
 }
@@ -260,7 +260,7 @@ resource "aws_lb" "jenkins" {
   security_groups    = [aws_security_group.jenkins_alb.id]
   subnets            = var.public_subnet_ids
 
-  enable_deletion_protection = false  # Lab: allow easy deletion
+  enable_deletion_protection = false # Lab: allow easy deletion
 
   tags = var.tags
 }

@@ -47,7 +47,7 @@ resource "aws_subnet" "public" {
     "kubernetes.io/cluster/${var.cluster_name}" = "shared"
     "kubernetes.io/role/elb"                    = "1"
     # Also tag for internal ELB so ALB controller has full subnet visibility
-    "kubernetes.io/role/internal-elb"           = "1"
+    "kubernetes.io/role/internal-elb" = "1"
   })
 }
 
@@ -106,7 +106,7 @@ resource "aws_route_table_association" "private" {
 # Kept even in lab — good practice and costs almost nothing
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/aws/vpc/${var.project_name}-${var.environment}/flow-logs"
-  retention_in_days = 7  # Short retention for lab (30-90 days in production)
+  retention_in_days = 7 # Short retention for lab (30-90 days in production)
 
   tags = var.tags
 }

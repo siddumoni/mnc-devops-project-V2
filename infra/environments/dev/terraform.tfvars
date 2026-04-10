@@ -12,10 +12,10 @@
 #   - 1 node normally  (Cluster Autoscaler adds 2nd only when needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-project_name    = "mnc-app"
-environment     = "dev"
-aws_region      = "ap-south-1"
-aws_account_id  = "ACCOUNT_ID_PLACEHOLDER"   # patched by infra.ps1 bootstrap
+project_name   = "mnc-app"
+environment    = "dev"
+aws_region     = "ap-south-1"
+aws_account_id = "ACCOUNT_ID_PLACEHOLDER" # patched by infra.ps1 bootstrap
 
 # ── Networking ────────────────────────────────────────────────────────────
 vpc_cidr             = "10.10.0.0/16"
@@ -25,19 +25,19 @@ availability_zones   = ["ap-south-1a", "ap-south-1b"]
 
 # ── Access ────────────────────────────────────────────────────────────────
 ec2_key_name        = "mnc-app-keypair"
-allowed_cidr_blocks = ["0.0.0.0/0"]   # Open for lab convenience
+allowed_cidr_blocks = ["0.0.0.0/0"] # Open for lab convenience
 
 # ── Jenkins EC2 ───────────────────────────────────────────────────────────
 # t3.large required: Jenkins + Maven + SonarQube Docker need ~5GB RAM together
-jenkins_ami_id        = "AMI_ID_PLACEHOLDER"   # patched by infra.ps1 bootstrap
+jenkins_ami_id        = "AMI_ID_PLACEHOLDER" # patched by infra.ps1 bootstrap
 jenkins_instance_type = "t3.large"
 
 # ── EKS ───────────────────────────────────────────────────────────────────
 kubernetes_version  = "1.32"
-node_instance_types = ["t3.small"]   # 2 vCPU, 2GB — smallest viable for app pods
-desired_nodes       = 1              # Start with 1, Cluster Autoscaler adds 2nd if needed
+node_instance_types = ["t3.small"] # 2 vCPU, 2GB — smallest viable for app pods
+desired_nodes       = 1            # Start with 1, Cluster Autoscaler adds 2nd if needed
 min_nodes           = 1
-max_nodes           = 2              # Max 2 to cap cost
+max_nodes           = 2 # Max 2 to cap cost
 
 # ── RDS ───────────────────────────────────────────────────────────────────
 db_username       = "appuser"
