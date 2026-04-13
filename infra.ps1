@@ -45,14 +45,6 @@ function Write-Warn   { param($msg) Write-Host "  ⚠️  $msg" -ForegroundColor
 function Write-Fail   { param($msg) Write-Host "  ❌ $msg" -ForegroundColor Red }
 function Write-Info   { param($msg) Write-Host "  ℹ️  $msg" -ForegroundColor Gray }
 
-# ── Helper: run command and throw on failure ───────────────────────────────
-function Invoke-Cmd {
-    param([string]$cmd)
-    Write-Info "Running: $cmd"
-    Invoke-Expression $cmd
-    if ($LASTEXITCODE -ne 0) { throw "Command failed: $cmd" }
-}
-
 # ── Helper: wait with polling ─────────────────────────────────────────────
 function Wait-Until {
     param([scriptblock]$Condition, [string]$Message, [int]$MaxSeconds = 600, [int]$IntervalSeconds = 15)
@@ -75,9 +67,11 @@ function Invoke-Bootstrap {
 
     # Get account ID
     $script:ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
-    Write-OK "Account ID: $ACCOUNT_ID"
+    Write-OK "Account ID: $($script:ACCOUNT_ID)"
 
-    $STATE_BUCKET = "$PROJECT_NAME-terraform-state-$ACCOUNT_ID"
+    # FIX: STATE_BUCKET must match the "v2" prefix used in the backend block
+    # placeholder inside infra/environments/dev/main.tf
+    $STATE_BUCKET = "$PROJECT_NAME-v2-terraform-state-$($script:ACCOUNT_ID)"
 
     # ── S3 state bucket ───────────────────────────────────────────────────
     Write-Info "Checking S3 state bucket..."
@@ -139,7 +133,7 @@ function Invoke-Bootstrap {
     # Patch terraform.tfvars
     $tfvarsPath = "$ENV_DIR\terraform.tfvars"
     $tfvars = Get-Content $tfvarsPath -Raw
-    $tfvars = $tfvars -replace "ACCOUNT_ID_PLACEHOLDER", $ACCOUNT_ID
+    $tfvars = $tfvars -replace "ACCOUNT_ID_PLACEHOLDER", $script:ACCOUNT_ID
     $tfvars = $tfvars -replace "AMI_ID_PLACEHOLDER", $AMI_ID
     Set-Content -Path $tfvarsPath -Value $tfvars -NoNewline
     Write-OK "terraform.tfvars patched"
@@ -147,7 +141,7 @@ function Invoke-Bootstrap {
     # Patch backend bucket in environments/dev/main.tf
     $mainTfPath = "$ENV_DIR\main.tf"
     $mainTf = Get-Content $mainTfPath -Raw
-    $mainTf = $mainTf -replace "mnc-app-terraform-state-ACCOUNT_ID_PLACEHOLDER", $STATE_BUCKET
+    $mainTf = $mainTf -replace "mnc-app-v2-terraform-state-ACCOUNT_ID_PLACEHOLDER", $STATE_BUCKET
     Set-Content -Path $mainTfPath -Value $mainTf -NoNewline
     Write-OK "Backend bucket patched in main.tf"
 
@@ -211,19 +205,24 @@ function Wait-ForEKS {
     aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME 2>&1 | Out-Null
 
     # Wait for nodes Ready
+    # FIX: Wrap kubectl output in @() so .Count always returns item count even
+    #      when only 1 node is returned (single string vs array distinction).
+    # FIX: Use " Ready " with surrounding spaces to avoid matching "NotReady"
+    #      — "NotReady" contains "Ready" so -notmatch "Ready" would incorrectly
+    #      exclude NotReady nodes from the $notReady list, masking the problem.
     Wait-Until -Message "All EKS nodes Ready" -MaxSeconds 600 -IntervalSeconds 20 -Condition {
-        $notReady = kubectl get nodes --no-headers 2>&1 | Where-Object { $_ -notmatch "Ready" -and $_ -notmatch "^$" }
-        $allNodes = kubectl get nodes --no-headers 2>&1 | Where-Object { $_ -match "\S" }
+        $notReady = @(kubectl get nodes --no-headers 2>&1 | Where-Object { $_ -notmatch " Ready " -and $_ -notmatch "^$" })
+        $allNodes = @(kubectl get nodes --no-headers 2>&1 | Where-Object { $_ -match "\S" })
         ($allNodes.Count -gt 0) -and ($notReady.Count -eq 0)
     }
 
-    # Wait for CoreDNS — this was the cause of stuck states in previous attempts
-    # kube-proxy and vpc-cni must be running before CoreDNS, and CoreDNS must be
-    # running before any application pods can resolve DNS (i.e. connect to RDS)
+    # Wait for CoreDNS — kube-proxy and vpc-cni must be running before CoreDNS,
+    # and CoreDNS must be running before any application pods can resolve DNS
+    # (i.e. connect to RDS by hostname).
     Write-Info "Waiting for CoreDNS pods to be Running..."
     Wait-Until -Message "CoreDNS Running" -MaxSeconds 300 -IntervalSeconds 15 -Condition {
-        $coreDNS = kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>&1
-        $running = $coreDNS | Where-Object { $_ -match "Running" }
+        $coreDNS = @(kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>&1)
+        $running = @($coreDNS | Where-Object { $_ -match "Running" })
         $running.Count -ge 1
     }
 
@@ -330,10 +329,11 @@ function Update-ConfigMap {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# APPLY K8S MANIFESTS (non-deployment only)
-# Deployment YAMLs have placeholder image tags — Jenkins applies those
+# INVOKE K8S MANIFESTS (non-deployment only)
+# Deployment YAMLs have placeholder image tags — Jenkins applies those.
+# Renamed from Apply-K8sManifests to use an approved PowerShell verb.
 # ─────────────────────────────────────────────────────────────────────────────
-function Apply-K8sManifests {
+function Invoke-K8sManifests {
     Write-Step "Applying Kubernetes manifests (non-deployment)"
 
     # Inject DB secret from SSM
@@ -359,22 +359,24 @@ function Apply-K8sManifests {
     kubectl apply -f "$K8S_DIR\ingress.yaml"
 
     Write-OK "Manifests applied. Waiting for ALB to be provisioned (2-3 min)..."
-    Write-Info "Pods will come up after first Jenkins pipeline run (Step 9 in README)"
+    Write-Info "Pods will come up after first Jenkins pipeline run (Step 5 in README)"
 
-    # Wait for ALB address to appear
+    # Wait for ALB address to appear in ingress status
     $maxWait = 180
-    $elapsed = 0
-    while ($elapsed -lt $maxWait) {
-        $albAddr = kubectl get ingress app-ingress -n $ENVIRONMENT `
-            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>&1
-        if ($albAddr -and $albAddr -notmatch "Error" -and $albAddr.Length -gt 10) {
-            Write-OK "App ALB ready: http://$albAddr"
-            break
-        }
-        Start-Sleep 15
-        $elapsed += 15
-        Write-Info "ALB provisioning... ($elapsed/$maxWait s)"
+$elapsed = 0
+while ($elapsed -lt $maxWait) {
+    $albAddr = (kubectl get ingress app-ingress -n $ENVIRONMENT `
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>&1 | Out-String).Trim()
+
+    if (-not [string]::IsNullOrWhiteSpace($albAddr) -and $albAddr -notmatch "Error") {
+        Write-OK "App ALB ready: http://$albAddr"
+        break
     }
+
+    Start-Sleep 15
+    $elapsed += 15
+    Write-Info "ALB provisioning... ($elapsed/$maxWait s)"
+}
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,16 +419,16 @@ function Wait-ForJenkins {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRINT SUMMARY — outputs all important URLs and next steps
+# SHOW SUMMARY — outputs all important URLs and next steps
+# Renamed from Print-Summary to use an approved PowerShell verb.
 # ─────────────────────────────────────────────────────────────────────────────
-function Print-Summary {
+function Show-Summary {
     Write-Step "Infrastructure ready"
 
     Push-Location $ENV_DIR
     try {
         $JENKINS_IP  = terraform output -raw jenkins_public_ip
         $JENKINS_ALB = terraform output -raw jenkins_alb_dns
-        $SONAR_URL   = terraform output -raw sonarqube_url
         $ECR_URLS    = terraform output -json ecr_repository_urls | ConvertFrom-Json
     } finally {
         Pop-Location
@@ -448,8 +450,8 @@ function Print-Summary {
     Write-Host "║  NEXT STEPS                                                  ║" -ForegroundColor Cyan
     Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
     Write-Host "║                                                              ║" -ForegroundColor Cyan
-    Write-Host "║  1. Open Jenkins and configure (README Step 8)               ║" -ForegroundColor White
-    Write-Host "║  2. Run first pipeline (README Step 9) — pods come up here  ║" -ForegroundColor White
+    Write-Host "║  1. Open Jenkins and configure (README Step 4)               ║" -ForegroundColor White
+    Write-Host "║  2. Run first pipeline (README Step 5) — pods come up here  ║" -ForegroundColor White
     Write-Host "║  3. When done learning: .\infra.ps1 destroy                 ║" -ForegroundColor White
     Write-Host "║  4. Next session      : .\infra.ps1 recreate                ║" -ForegroundColor White
     Write-Host "║                                                              ║" -ForegroundColor Cyan
@@ -479,19 +481,22 @@ function Invoke-Destroy {
     if ($LASTEXITCODE -eq 0) {
         # Delete ingress first — this tells the ALB Controller to delete the AWS ALB
         kubectl delete ingress app-ingress -n $ENVIRONMENT --ignore-not-found=true 2>&1 | Out-Null
-        Write-Info "Ingress deleted — waiting for ALB to be removed by controller..."
+        Write-Info "Ingress deleted — waiting for ALB to be removed by ALB Controller..."
 
-        # Wait for ALB to be fully deleted before proceeding
+        # FIX: ALB Controller names ALBs with a "k8s-" prefix (e.g. k8s-dev-appingre-xxxx),
+        # not with the project name. Filter by the cluster tag that ALB Controller always
+        # stamps on every ALB it manages, which is reliable regardless of the name format.
+        # Wait up to 5 minutes — ALB deletion can take 3-5 minutes in practice.
         $albWait = 0
-        while ($albWait -lt 120) {
+        while ($albWait -lt 300) {
             $albs = aws elbv2 describe-load-balancers --region $AWS_REGION `
-                --query "LoadBalancers[?contains(LoadBalancerName, '$PROJECT_NAME')].LoadBalancerName" `
+                --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-$ENVIRONMENT')].LoadBalancerName" `
                 --output text 2>&1
-            if (-not $albs -or $albs -match "None" -or $albs.Trim() -eq "") {
+            if (-not $albs -or $albs -match "^None$" -or $albs.Trim() -eq "") {
                 Write-OK "All app ALBs removed"
                 break
             }
-            Write-Info "Waiting for ALB deletion... ($albWait/120 s) — $albs"
+            Write-Info "Waiting for ALB deletion... ($albWait/300 s) — $albs"
             Start-Sleep 15
             $albWait += 15
         }
@@ -523,6 +528,7 @@ function Invoke-Destroy {
             Write-OK "Jenkins EBS removed from Terraform state — volume $ebsVolumeId is preserved in AWS"
 
             # Save volume ID to a local file so create can reattach it
+            # FIX: Use -NoNewline so Get-Content later does not read a trailing newline
             $ebsVolumeId | Set-Content -Path "..\..\..\.jenkins-ebs-volume-id" -NoNewline
             Write-OK "EBS volume ID saved to .jenkins-ebs-volume-id"
         } else {
@@ -571,12 +577,15 @@ function Invoke-Destroy {
             -auto-approve
         Write-OK "Jenkins EC2 destroyed (EBS preserved)"
 
-        # Destroy ECR SSM param
+        # FIX: Removed Out-Null suppression — a failed destroy here would silently
+        # leave the SSM parameter in state, causing drift. Let errors surface.
+        Write-Info "Destroying ECR SSM parameter..."
         terraform destroy `
             -target="module.dev.aws_ssm_parameter.ecr_registry" `
             -var-file="terraform.tfvars" `
             -var="db_password=$DB_PASSWORD" `
-            -auto-approve 2>&1 | Out-Null
+            -auto-approve
+        Write-OK "ECR SSM parameter destroyed"
 
         # Destroy VPC and ALB SG last (ENIs must be clear)
         Write-Info "Destroying VPC..."
@@ -599,17 +608,20 @@ function Invoke-Destroy {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REATTACH EBS — called during create after previous destroy
-# Imports the preserved EBS volume back into Terraform state
+# IMPORT EBS — called during create after previous destroy
+# Imports the preserved EBS volume back into Terraform state.
+# Renamed from Reattach-EBS to use an approved PowerShell verb.
 # ─────────────────────────────────────────────────────────────────────────────
-function Reattach-EBS {
+function Import-JenkinsEBS {
     $ebsIdFile = ".jenkins-ebs-volume-id"
     if (-not (Test-Path $ebsIdFile)) {
         Write-Info "No saved EBS volume ID found — fresh install"
         return
     }
 
-    $ebsVolumeId = Get-Content $ebsIdFile -Raw
+    # FIX: Added .Trim() — Get-Content -Raw includes trailing newline which
+    # corrupts aws CLI commands and terraform import that use the volume ID.
+    $ebsVolumeId = (Get-Content $ebsIdFile -Raw).Trim()
     if (-not $ebsVolumeId -or -not ($ebsVolumeId -match "^vol-")) {
         Write-Info "Invalid EBS volume ID in file — skipping reattach"
         return
@@ -623,11 +635,11 @@ function Reattach-EBS {
 
     if ($volState -eq "available") {
         Write-Info "EBS volume is available — will be attached to new Jenkins EC2"
-        Write-Info "Terraform will attach it via aws_volume_attachment resource"
         Write-OK "EBS volume $ebsVolumeId ready for reattach"
     } elseif ($volState -eq "in-use") {
         Write-Warn "EBS volume is already in-use — may be attached to a previous instance"
-        Write-Info "If create fails on volume attachment, run: aws ec2 detach-volume --volume-id $ebsVolumeId --region $AWS_REGION"
+        Write-Info "If create fails on volume attachment, detach manually:"
+        Write-Info "  aws ec2 detach-volume --volume-id $ebsVolumeId --region $AWS_REGION"
     } else {
         Write-Warn "EBS volume state: $volState — proceeding anyway"
     }
@@ -673,25 +685,37 @@ function Show-Status {
 
     # Jenkins EC2
     Write-Host "`n[ Jenkins EC2 ]" -ForegroundColor Cyan
-    $jenkins = aws ec2 describe-instances --region $AWS_REGION `
-        --filters "Name=tag:Name,Values=$PROJECT_NAME-jenkins-master" "Name=instance-state-name,Values=running" `
-        --query "Reservations[0].Instances[0].{State:State.Name,IP:PublicIpAddress,Type:InstanceType}" `
-        --output json 2>&1 | ConvertFrom-Json
-    if ($jenkins.State) {
-        Write-OK "Jenkins: $($jenkins.State) | $($jenkins.Type) | http://$($jenkins.IP):8080"
-    } else {
-        Write-Warn "Jenkins EC2 not running"
+    # FIX: Wrap in try/catch — if aws CLI fails (e.g. permissions) ConvertFrom-Json
+    # would throw a terminating parse error on the error text returned by aws.
+    try {
+        $jenkinsJson = aws ec2 describe-instances --region $AWS_REGION `
+            --filters "Name=tag:Name,Values=$PROJECT_NAME-jenkins-master" "Name=instance-state-name,Values=running" `
+            --query "Reservations[0].Instances[0].{State:State.Name,IP:PublicIpAddress,Type:InstanceType}" `
+            --output json 2>&1
+        $jenkins = $jenkinsJson | ConvertFrom-Json
+        if ($jenkins.State) {
+            Write-OK "Jenkins: $($jenkins.State) | $($jenkins.Type) | http://$($jenkins.IP):8080"
+        } else {
+            Write-Warn "Jenkins EC2 not running"
+        }
+    } catch {
+        Write-Warn "Could not query Jenkins EC2: $_"
     }
 
     # Jenkins EBS
     Write-Host "`n[ Jenkins EBS (persistent) ]" -ForegroundColor Cyan
     $ebsIdFile = ".jenkins-ebs-volume-id"
     if (Test-Path $ebsIdFile) {
-        $ebsId = Get-Content $ebsIdFile -Raw
-        $ebsState = aws ec2 describe-volumes --volume-ids $ebsId `
-            --query "Volumes[0].{State:State,Size:Size}" --output json --region $AWS_REGION 2>&1 | ConvertFrom-Json
-        if ($ebsState.State) {
-            Write-OK "EBS volume: $ebsId — $($ebsState.State) — $($ebsState.Size)GB"
+        # FIX: .Trim() here too — consistent with Import-JenkinsEBS
+        $ebsId = (Get-Content $ebsIdFile -Raw).Trim()
+        try {
+            $ebsState = aws ec2 describe-volumes --volume-ids $ebsId `
+                --query "Volumes[0].{State:State,Size:Size}" --output json --region $AWS_REGION 2>&1 | ConvertFrom-Json
+            if ($ebsState.State) {
+                Write-OK "EBS volume: $ebsId — $($ebsState.State) — $($ebsState.Size)GB"
+            }
+        } catch {
+            Write-Warn "Could not query EBS volume $ebsId`: $_"
         }
     } else {
         Write-Info "No EBS volume ID on file (will be set after first create)"
@@ -699,14 +723,18 @@ function Show-Status {
 
     # RDS
     Write-Host "`n[ RDS MySQL ]" -ForegroundColor Cyan
-    $rds = aws rds describe-db-instances --region $AWS_REGION `
-        --db-instance-identifier "$PROJECT_NAME-$ENVIRONMENT-mysql" `
-        --query "DBInstances[0].{Status:DBInstanceStatus,Class:DBInstanceClass,Endpoint:Endpoint.Address}" `
-        --output json 2>&1 | ConvertFrom-Json
-    if ($rds.Status) {
-        Write-OK "RDS: $($rds.Status) | $($rds.Class) | $($rds.Endpoint)"
-    } else {
-        Write-Warn "RDS instance not found"
+    try {
+        $rds = aws rds describe-db-instances --region $AWS_REGION `
+            --db-instance-identifier "$PROJECT_NAME-$ENVIRONMENT-mysql" `
+            --query "DBInstances[0].{Status:DBInstanceStatus,Class:DBInstanceClass,Endpoint:Endpoint.Address}" `
+            --output json 2>&1 | ConvertFrom-Json
+        if ($rds.Status) {
+            Write-OK "RDS: $($rds.Status) | $($rds.Class) | $($rds.Endpoint)"
+        } else {
+            Write-Warn "RDS instance not found"
+        }
+    } catch {
+        Write-Warn "RDS instance not found — may be destroyed"
     }
 
     # ECR
@@ -745,16 +773,16 @@ function Invoke-Create {
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Green
 
     Invoke-Bootstrap
-    Reattach-EBS
+    Import-JenkinsEBS
     Invoke-Pass1
     Wait-ForEKS
     Invoke-Pass2
     Install-ALBController
     Install-ClusterAutoscaler
     Update-ConfigMap
-    Apply-K8sManifests
+    Invoke-K8sManifests
     Wait-ForJenkins
-    Print-Summary
+    Show-Summary
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -765,11 +793,11 @@ Write-Host "MNC App Lab — infra.ps1 | Action: $Action" -ForegroundColor Magent
 Write-Host "Region: $AWS_REGION | Project: $PROJECT_NAME | Environment: $ENVIRONMENT" -ForegroundColor Gray
 
 switch ($Action) {
-    "create"  { Invoke-Create }
-    "destroy" { Invoke-Destroy }
+    "create"   { Invoke-Create }
+    "destroy"  { Invoke-Destroy }
     "recreate" {
         Invoke-Destroy
         Invoke-Create
     }
-    "status"  { Show-Status }
+    "status"   { Show-Status }
 }

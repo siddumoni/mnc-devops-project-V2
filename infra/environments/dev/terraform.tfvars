@@ -15,7 +15,7 @@
 project_name   = "mnc-app"
 environment    = "dev"
 aws_region     = "ap-south-1"
-aws_account_id = "ACCOUNT_ID_PLACEHOLDER" # patched by infra.ps1 bootstrap
+aws_account_id = "204803374292" # patched by infra.ps1 bootstrap
 
 # ── Networking ────────────────────────────────────────────────────────────
 vpc_cidr             = "10.10.0.0/16"
@@ -29,7 +29,7 @@ allowed_cidr_blocks = ["0.0.0.0/0"] # Open for lab convenience
 
 # ── Jenkins EC2 ───────────────────────────────────────────────────────────
 # t3.large required: Jenkins + Maven + SonarQube Docker need ~5GB RAM together
-jenkins_ami_id        = "AMI_ID_PLACEHOLDER" # patched by infra.ps1 bootstrap
+jenkins_ami_id        = "ami-0c95fa15b20f5400e" # patched by infra.ps1 bootstrap
 jenkins_instance_type = "t3.large"
 
 # ── EKS ───────────────────────────────────────────────────────────────────

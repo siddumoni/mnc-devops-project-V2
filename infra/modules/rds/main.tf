@@ -8,7 +8,7 @@ resource "aws_db_subnet_group" "main" {
 
 resource "aws_security_group" "rds" {
   name        = "${var.project_name}-${var.environment}-rds-sg"
-  description = "RDS MySQL — inbound from EKS nodes and Jenkins only"
+  description = "RDS MySQL - inbound from EKS nodes and Jenkins only"
   vpc_id      = var.vpc_id
 
   ingress {

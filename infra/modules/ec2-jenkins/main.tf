@@ -148,7 +148,7 @@ resource "aws_security_group" "jenkins" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound — Jenkins needs GitHub, ECR, EKS, SonarQube, DockerHub"
+    description = "All outbound Jenkins needs GitHub ECR EKS SonarQube DockerHub"
   }
 
   tags = merge(var.tags, {

@@ -22,7 +22,7 @@ terraform {
 
   backend "s3" {
     # infra.ps1 bootstrap patches this bucket name automatically
-    bucket         = "mnc-app-v2-terraform-state-ACCOUNT_ID_PLACEHOLDER"
+    bucket         = "mnc-app-v2-terraform-state-204803374292"
     key            = "environments/dev/terraform.tfstate"
     region         = "ap-south-1"
     encrypt        = true
