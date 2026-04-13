@@ -35,7 +35,7 @@ provider "aws" {
 }
 
 provider "kubernetes" {
-  host                   = module.dev.cluster_endpoint
+  host                   = try(module.dev.cluster_endpoint, "")
   cluster_ca_certificate = base64decode(module.dev.cluster_ca_certificate)
 
   exec {

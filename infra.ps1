@@ -161,6 +161,11 @@ function Invoke-Pass1 {
         terraform init -reconfigure | Out-Null
         Write-OK "terraform init complete"
 
+        # Import preserved EBS AFTER init so the state write survives
+        Pop-Location
+        Import-JenkinsEBS
+        Push-Location $ENV_DIR
+
         Write-Info "terraform apply Pass 1 (AWS resources only — skipping kubernetes_namespace)..."
         terraform apply `
             -target="module.dev.module.vpc" `
@@ -773,7 +778,6 @@ function Invoke-Create {
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Green
 
     Invoke-Bootstrap
-    Import-JenkinsEBS
     Invoke-Pass1
     Wait-ForEKS
     Invoke-Pass2
