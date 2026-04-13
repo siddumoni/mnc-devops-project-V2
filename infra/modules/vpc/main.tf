@@ -107,7 +107,9 @@ resource "aws_route_table_association" "private" {
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/aws/vpc/${var.project_name}-${var.environment}/flow-logs"
   retention_in_days = 7 # Short retention for lab (30-90 days in production)
-
+  lifecycle {
+    create_before_destroy = true
+  }
   tags = var.tags
 }
 

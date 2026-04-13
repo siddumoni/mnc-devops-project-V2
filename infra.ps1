@@ -151,21 +151,34 @@ function Invoke-Bootstrap {
 # ─────────────────────────────────────────────────────────────────────────────
 # PASS 1 — AWS infrastructure (VPC, Jenkins, ECR, EKS cluster, RDS)
 # Skips kubernetes_namespace because EKS does not exist yet
+#
+# FIX: Split into separate try/finally blocks so terraform init and
+# Import-JenkinsEBS run cleanly before apply. The original single
+# Push-Location block caused location-stack confusion when Import-JenkinsEBS
+# did its own Push/Pop inside. Also removed | Out-Null from terraform init
+# so errors are visible and actually stop execution.
 # ─────────────────────────────────────────────────────────────────────────────
 function Invoke-Pass1 {
     Write-Step "Pass 1 — Creating AWS infrastructure"
 
+    # Step A: terraform init in its own block — errors must not be swallowed
     Push-Location $ENV_DIR
     try {
         Write-Info "terraform init..."
-        terraform init -reconfigure | Out-Null
+        terraform init -reconfigure
+        if ($LASTEXITCODE -ne 0) { throw "terraform init failed" }
         Write-OK "terraform init complete"
-
-        # Import preserved EBS AFTER init so the state write survives
+    } finally {
         Pop-Location
-        Import-JenkinsEBS
-        Push-Location $ENV_DIR
+    }
 
+    # Step B: Import preserved EBS AFTER init, BEFORE apply, in its own call
+    # Import-JenkinsEBS manages its own Push/Pop internally
+    Import-JenkinsEBS
+
+    # Step C: Pass 1 apply in its own block
+    Push-Location $ENV_DIR
+    try {
         Write-Info "terraform apply Pass 1 (AWS resources only — skipping kubernetes_namespace)..."
         terraform apply `
             -target="module.dev.module.vpc" `
@@ -183,6 +196,20 @@ function Invoke-Pass1 {
             -auto-approve
 
         if ($LASTEXITCODE -ne 0) { throw "Pass 1 terraform apply failed" }
+
+        # FIX: Verify after apply that the EBS volume in state matches the
+        # preserved volume ID. Catches the case where import silently failed
+        # and Terraform created a brand new EBS volume instead.
+        $ebsIdFile = "..\..\..\.jenkins-ebs-volume-id"
+        if (Test-Path $ebsIdFile) {
+            $expectedId = (Get-Content $ebsIdFile -Raw).Trim()
+            $actualId   = (terraform output -raw jenkins_ebs_volume_id 2>&1).Trim()
+            if ($actualId -ne $expectedId) {
+                throw "EBS VOLUME MISMATCH: expected $expectedId but Terraform used $actualId. Your Jenkins data is on the wrong volume. Investigate before proceeding — do NOT destroy without backing up $actualId."
+            }
+            Write-OK "EBS volume verified: $actualId matches preserved volume"
+        }
+
         Write-OK "Pass 1 complete"
     } finally {
         Pop-Location
@@ -368,20 +395,20 @@ function Invoke-K8sManifests {
 
     # Wait for ALB address to appear in ingress status
     $maxWait = 180
-$elapsed = 0
-while ($elapsed -lt $maxWait) {
-    $albAddr = (kubectl get ingress app-ingress -n $ENVIRONMENT `
-        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>&1 | Out-String).Trim()
+    $elapsed = 0
+    while ($elapsed -lt $maxWait) {
+        $albAddr = (kubectl get ingress app-ingress -n $ENVIRONMENT `
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>&1 | Out-String).Trim()
 
-    if (-not [string]::IsNullOrWhiteSpace($albAddr) -and $albAddr -notmatch "Error") {
-        Write-OK "App ALB ready: http://$albAddr"
-        break
+        if (-not [string]::IsNullOrWhiteSpace($albAddr) -and $albAddr -notmatch "Error") {
+            Write-OK "App ALB ready: http://$albAddr"
+            break
+        }
+
+        Start-Sleep 15
+        $elapsed += 15
+        Write-Info "ALB provisioning... ($elapsed/$maxWait s)"
     }
-
-    Start-Sleep 15
-    $elapsed += 15
-    Write-Info "ALB provisioning... ($elapsed/$maxWait s)"
-}
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,23 +551,28 @@ function Invoke-Destroy {
     Push-Location $ENV_DIR
     try {
         $ebsVolumeId = terraform output -raw jenkins_ebs_volume_id 2>&1
-        if ($LASTEXITCODE -eq 0 -and $ebsVolumeId -match "^vol-") {
-            Write-Info "Jenkins EBS volume ID: $ebsVolumeId"
 
-            # Remove volume attachment from state first, then the volume itself
-            terraform state rm "module.dev.module.jenkins.aws_volume_attachment.jenkins_home" 2>&1 | Out-Null
-            terraform state rm "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" 2>&1 | Out-Null
-            Write-OK "Jenkins EBS removed from Terraform state — volume $ebsVolumeId is preserved in AWS"
-
-            # Save volume ID to a local file so create can reattach it
-            # FIX: Use -NoNewline so Get-Content later does not read a trailing newline
-            $ebsVolumeId | Set-Content -Path "..\..\..\.jenkins-ebs-volume-id" -NoNewline
-            Write-OK "EBS volume ID saved to .jenkins-ebs-volume-id"
-        } else {
-            Write-Warn "Could not get EBS volume ID — it may have already been removed from state"
+        # FIX: Guard against empty or invalid output before removing from state
+        # and before writing to file. If we can't confirm the volume ID, we
+        # refuse to continue — destroying without knowing the ID risks data loss.
+        if ($LASTEXITCODE -ne 0 -or -not ($ebsVolumeId -match "^vol-")) {
+            throw "Could not get Jenkins EBS volume ID from Terraform output ('$ebsVolumeId'). Refusing to continue destroy — investigate manually before proceeding."
         }
+
+        Write-Info "Jenkins EBS volume ID confirmed: $ebsVolumeId"
+
+        # Remove volume attachment from state first, then the volume itself
+        terraform state rm "module.dev.module.jenkins.aws_volume_attachment.jenkins_home" 2>&1 | Out-Null
+        terraform state rm "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" 2>&1 | Out-Null
+        Write-OK "Jenkins EBS removed from Terraform state — volume $ebsVolumeId is preserved in AWS"
+
+        # FIX: Save AFTER confirming valid ID, with -NoNewline to prevent
+        # trailing newline corrupting volume ID reads in Import-JenkinsEBS
+        $ebsVolumeId | Set-Content -Path "..\..\..\.jenkins-ebs-volume-id" -NoNewline
+        Write-OK "EBS volume ID saved to .jenkins-ebs-volume-id"
     } catch {
-        Write-Warn "Error removing EBS from state: $_"
+        Write-Fail "Error removing EBS from state: $_"
+        throw
     } finally {
         Pop-Location
     }
@@ -615,7 +647,17 @@ function Invoke-Destroy {
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORT EBS — called during create after previous destroy
 # Imports the preserved EBS volume back into Terraform state.
-# Renamed from Reattach-EBS to use an approved PowerShell verb.
+#
+# FIX 1: try/catch around terraform import does nothing useful because
+# Terraform CLI failures set $LASTEXITCODE, not PowerShell exceptions.
+# Now checks $LASTEXITCODE explicitly and throws hard on failure so the
+# entire create is aborted rather than silently creating a new EBS volume.
+#
+# FIX 2: Checks terraform state list first to skip import if the volume
+# is already in state (idempotent — safe to call multiple times).
+#
+# FIX 3: Handles the "in-use" case by force-detaching before importing,
+# instead of just printing a warning and hoping for the best.
 # ─────────────────────────────────────────────────────────────────────────────
 function Import-JenkinsEBS {
     $ebsIdFile = ".jenkins-ebs-volume-id"
@@ -624,8 +666,8 @@ function Import-JenkinsEBS {
         return
     }
 
-    # FIX: Added .Trim() — Get-Content -Raw includes trailing newline which
-    # corrupts aws CLI commands and terraform import that use the volume ID.
+    # FIX: .Trim() — Get-Content -Raw includes trailing newline which corrupts
+    # aws CLI and terraform import commands that use the volume ID.
     $ebsVolumeId = (Get-Content $ebsIdFile -Raw).Trim()
     if (-not $ebsVolumeId -or -not ($ebsVolumeId -match "^vol-")) {
         Write-Info "Invalid EBS volume ID in file — skipping reattach"
@@ -634,35 +676,135 @@ function Import-JenkinsEBS {
 
     Write-Step "Reattaching preserved Jenkins EBS volume: $ebsVolumeId"
 
-    # Verify volume exists in AWS and is available
+    # Verify volume exists in AWS
     $volState = aws ec2 describe-volumes --volume-ids $ebsVolumeId `
         --query "Volumes[0].State" --output text --region $AWS_REGION 2>&1
 
-    if ($volState -eq "available") {
-        Write-Info "EBS volume is available — will be attached to new Jenkins EC2"
-        Write-OK "EBS volume $ebsVolumeId ready for reattach"
-    } elseif ($volState -eq "in-use") {
-        Write-Warn "EBS volume is already in-use — may be attached to a previous instance"
-        Write-Info "If create fails on volume attachment, detach manually:"
-        Write-Info "  aws ec2 detach-volume --volume-id $ebsVolumeId --region $AWS_REGION"
-    } else {
-        Write-Warn "EBS volume state: $volState — proceeding anyway"
+    if ($LASTEXITCODE -ne 0) {
+        throw "EBS volume $ebsVolumeId not found in AWS — cannot continue. Your Jenkins data may be lost."
     }
 
-    # Import the EBS volume back into Terraform state so Terraform manages it
+    Write-Info "EBS volume state: $volState"
+
+    # FIX: If still attached to the old (destroyed) EC2, force-detach it now
+    # rather than warning and hoping the apply figures it out.
+    if ($volState -eq "in-use") {
+        Write-Warn "EBS volume is still in-use — force-detaching from previous instance..."
+        aws ec2 detach-volume --volume-id $ebsVolumeId --force --region $AWS_REGION | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to detach EBS volume $ebsVolumeId. Investigate in AWS Console before retrying."
+        }
+        Write-Info "Waiting 30s for detach to complete..."
+        Start-Sleep 30
+        $volState = (aws ec2 describe-volumes --volume-ids $ebsVolumeId `
+            --query "Volumes[0].State" --output text --region $AWS_REGION 2>&1).Trim()
+        Write-Info "EBS volume state after detach: $volState"
+    }
+
+    if ($volState -ne "available") {
+        throw "EBS volume $ebsVolumeId is in state '$volState' — expected 'available'. Cannot import. Investigate in AWS Console."
+    }
+
+    $mainTfOriginal = $null  # initialised here so finally block can safely check it
     Push-Location $ENV_DIR
     try {
+        # Check if already in state — idempotent, safe to call multiple times
+        $inState = terraform state list 2>&1 | Where-Object { $_ -match "aws_ebs_volume\.jenkins_home" }
+        if ($inState) {
+            Write-OK "EBS volume already in Terraform state — skipping import"
+            return
+        }
+
+        # The kubernetes provider block in environments/dev/main.tf references
+        # module.dev.cluster_endpoint and module.dev.cluster_ca_certificate.
+        # Those values only exist after the EKS cluster is created (Pass 1).
+        # When terraform import runs before Pass 1, Terraform initialises all
+        # providers, hits the kubernetes provider, finds the values unknown,
+        # and aborts — rolling back the state write entirely.
+        #
+        # Fix: temporarily comment out the kubernetes provider block in main.tf
+        # so Terraform skips it during import. After import, restore the file.
+        # This is safer than an override file (which Terraform rejects as a
+        # duplicate) and safer than modifying the provider source permanently.
+        $mainTfPath  = "main.tf"
+        $mainTfOriginal = Get-Content $mainTfPath -Raw
+
+        # Comment out the kubernetes provider block line-by-line using brace counting.
+        # This avoids regex scriptblock syntax which varies across PowerShell versions.
+        $tfLines   = $mainTfOriginal -split "`n"
+        $patched   = [System.Collections.Generic.List[string]]::new()
+        $inBlock   = $false
+        $depth     = 0
+        $patchedAny = $false
+        foreach ($tfLine in $tfLines) {
+            if (-not $inBlock -and $tfLine -match '^\s*provider\s+"kubernetes"\s*\{') {
+                $inBlock = $true; $depth = 1; $patchedAny = $true
+                $patched.Add("#KUBEPATCH# $tfLine"); continue
+            }
+            if ($inBlock) {
+                $patched.Add("#KUBEPATCH# $tfLine")
+                $depth += ([regex]::Matches($tfLine, "\{")).Count
+                $depth -= ([regex]::Matches($tfLine, "\}")).Count
+                if ($depth -le 0) { $inBlock = $false }
+                continue
+            }
+            $patched.Add($tfLine)
+        }
+        if (-not $patchedAny) {
+            throw "Could not locate kubernetes provider block in main.tf — cannot import safely."
+        }
+        $mainTfPatched = $patched -join "`n"
+        Set-Content -Path $mainTfPath -Value $mainTfPatched -NoNewline
+        Write-Info "kubernetes provider block commented out in main.tf for import"
+
+        # Re-init so Terraform picks up the patched main.tf
+        terraform init -reconfigure | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            # Restore before throwing
+            Set-Content -Path $mainTfPath -Value $mainTfOriginal -NoNewline
+            terraform init -reconfigure | Out-Null
+            throw "terraform init failed after patching main.tf"
+        }
+
         Write-Info "Importing EBS volume into Terraform state..."
         terraform import `
             -var-file="terraform.tfvars" `
             -var="db_password=$DB_PASSWORD" `
             "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" `
-            $ebsVolumeId 2>&1
+            $ebsVolumeId
 
-        Write-OK "EBS volume imported into Terraform state"
-    } catch {
-        Write-Warn "Import failed (may already be in state): $_"
+        $importExitCode = $LASTEXITCODE
+
+        # Restore main.tf unconditionally before any further checks
+        Set-Content -Path $mainTfPath -Value $mainTfOriginal -NoNewline
+        Write-Info "main.tf restored — kubernetes provider block re-enabled"
+
+        # Re-init with the real main.tf so subsequent commands work normally
+        terraform init -reconfigure | Out-Null
+
+        if ($importExitCode -ne 0) {
+            throw "terraform import failed for EBS volume $ebsVolumeId (exit code $importExitCode). Cannot continue — a new EBS would be created, losing your Jenkins data. Check state manually."
+        }
+
+        # Final confirmation — verify the resource is actually in state
+        $importedInState = terraform state list 2>&1 | Where-Object { $_ -match "aws_ebs_volume\.jenkins_home" }
+        if (-not $importedInState) {
+            throw "terraform import returned success but resource is NOT in state. EBS volume $ebsVolumeId was not imported. Check state manually."
+        }
+
+        Write-OK "EBS volume $ebsVolumeId successfully imported into Terraform state"
     } finally {
+        # Safety net — if we threw mid-patch, restore main.tf from the original
+        # content we captured at the start. $mainTfOriginal is only set if we
+        # got past the state-list check, so guard with a null check.
+        if ($null -ne $mainTfOriginal) {
+            $currentContent = Get-Content "main.tf" -Raw -ErrorAction SilentlyContinue
+            if ($currentContent -match "#KUBEPATCH#") {
+                Set-Content -Path "main.tf" -Value $mainTfOriginal -NoNewline
+                Write-Info "main.tf emergency-restored in finally block"
+                terraform init -reconfigure | Out-Null
+            }
+        }
         Pop-Location
     }
 }
