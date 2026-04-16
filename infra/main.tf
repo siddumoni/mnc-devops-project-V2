@@ -105,6 +105,7 @@ module "eks" {
   max_nodes           = var.max_nodes
   allowed_cidr_blocks = var.allowed_cidr_blocks
   tags                = local.common_tags
+  enable_kubernetes_resources = var.enable_kubernetes_resources
 }
 
 module "rds" {

@@ -251,6 +251,8 @@ resource "aws_eks_node_group" "main" {
 # Maps Jenkins IAM role → Kubernetes system:masters
 # This is how Jenkins runs kubectl commands against the cluster.
 resource "kubernetes_config_map_v1_data" "aws_auth" {
+  count = var.enable_kubernetes_resources ? 1 : 0   # ADD THIS LINE
+
   metadata {
     name      = "aws-auth"
     namespace = "kube-system"

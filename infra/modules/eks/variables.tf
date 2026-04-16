@@ -55,3 +55,8 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+variable "enable_kubernetes_resources" {
+  type    = bool
+  default = false
+}
