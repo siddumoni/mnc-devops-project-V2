@@ -161,12 +161,11 @@ function Invoke-Pass1 {
         terraform init -reconfigure | Out-Null
         Write-OK "terraform init complete"
 
-        # Import preserved EBS AFTER init so the state write survives
-        Pop-Location
+        # Import is now called INSIDE the Push-Location block,
+        # so it runs in the correct directory with the correct backend.
         Import-JenkinsEBS
-        Push-Location $ENV_DIR
 
-        Write-Info "terraform apply Pass 1 (AWS resources only — skipping kubernetes_namespace)..."
+        Write-Info "terraform apply Pass 1 (AWS resources, skipping kubernetes_namespace)..."
         terraform apply `
             -target="module.dev.module.vpc" `
             -target="module.dev.module.jenkins" `
@@ -634,58 +633,57 @@ function Invoke-Destroy {
 # Renamed from Reattach-EBS to use an approved PowerShell verb.
 # ─────────────────────────────────────────────────────────────────────────────
 function Import-JenkinsEBS {
-    $ebsIdFile = ".jenkins-ebs-volume-id"
+    # NOTE: Caller must already be inside $ENV_DIR when calling this function.
+    # This function does NOT push/pop location — it relies on the caller's context.
+
+    $ebsIdFile = "..\..\..\.jenkins-ebs-volume-id"   # relative to ENV_DIR
     if (-not (Test-Path $ebsIdFile)) {
         Write-Info "No saved EBS volume ID found — fresh install"
         return
     }
 
-    # FIX: Added .Trim() — Get-Content -Raw includes trailing newline which
-    # corrupts aws CLI commands and terraform import that use the volume ID.
     $ebsVolumeId = (Get-Content $ebsIdFile -Raw).Trim()
     if (-not $ebsVolumeId -or -not ($ebsVolumeId -match "^vol-")) {
         Write-Info "Invalid EBS volume ID in file — skipping reattach"
         return
     }
 
-    Write-Step "Reattaching preserved Jenkins EBS volume: $ebsVolumeId"
+    Write-Step "Reimporting preserved Jenkins EBS volume: $ebsVolumeId"
 
-    # Verify volume exists in AWS and is available
     $volState = aws ec2 describe-volumes --volume-ids $ebsVolumeId `
         --query "Volumes[0].State" --output text --region $AWS_REGION 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         throw "EBS volume $ebsVolumeId not found in AWS. Cannot continue — data may be lost."
     }
+
     Write-Info "EBS volume state: $volState"
 
-    if ($volState -eq "available") {
-        Write-Info "EBS volume is available — will be attached to new Jenkins EC2"
-        Write-OK "EBS volume $ebsVolumeId ready for reattach"
-    } elseif ($volState -eq "in-use") {
-        Write-Warn "EBS volume is already in-use — may be attached to a previous instance"
-        Write-Info "If create fails on volume attachment, detach manually:"
-        Write-Info "  aws ec2 detach-volume --volume-id $ebsVolumeId --region $AWS_REGION"
-    } else {
-        Write-Warn "EBS volume state: $volState — proceeding anyway"
+    if ($volState -eq "in-use") {
+        Write-Warn "Volume is still in-use. Attempting detach before import..."
+        aws ec2 detach-volume --volume-id $ebsVolumeId --region $AWS_REGION 2>&1 | Out-Null
+        Start-Sleep 15   # give AWS time to detach
     }
 
-    # Import the EBS volume back into Terraform state so Terraform manages it
-    Push-Location $ENV_DIR
-    try {
-        Write-Info "Importing EBS volume into Terraform state..."
-        terraform import `
-            -var-file="terraform.tfvars" `
-            -var="db_password=$DB_PASSWORD" `
-            "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" `
-            $ebsVolumeId 2>&1
-
-        Write-OK "EBS volume imported into Terraform state"
-    } catch {
-        Write-Warn "Import failed (may already be in state): $_"
-    } finally {
-        Pop-Location
+    # Check if already in state (idempotency — safe to re-run)
+    $stateList = terraform state list 2>&1
+    if ($stateList -match "module\.dev\.module\.jenkins\.aws_ebs_volume\.jenkins_home") {
+        Write-OK "EBS volume already in Terraform state — skipping import"
+        return
     }
+
+    Write-Info "Importing EBS volume into Terraform state..."
+    terraform import `
+        -var-file="terraform.tfvars" `
+        -var="db_password=$DB_PASSWORD" `
+        "module.dev.module.jenkins.aws_ebs_volume.jenkins_home" `
+        $ebsVolumeId
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "terraform import failed for EBS volume $ebsVolumeId — aborting to prevent data loss"
+    }
+
+    Write-OK "EBS volume $ebsVolumeId imported into Terraform state"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
