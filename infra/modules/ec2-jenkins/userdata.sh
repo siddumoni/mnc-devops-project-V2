@@ -22,10 +22,10 @@ echo "=== [1] System packages ==="
 dnf update -y -q
 dnf install -y -q git wget unzip jq
 
-# -- [2] Java 17
-echo "=== [2] Java 17 ==="
-if ! java -version 2>&1 | grep -q "17"; then
-  dnf install -y -q java-17-amazon-corretto-headless
+# -- [2] Java 21
+echo "=== [2] Java 21 ==="
+if ! java -version 2>&1 | grep -q "21"; then
+  dnf install -y -q java-21-amazon-corretto-headless
 fi
 java -version
 

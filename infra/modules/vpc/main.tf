@@ -106,10 +106,15 @@ resource "aws_route_table_association" "private" {
 # Kept even in lab — good practice and costs almost nothing
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/aws/vpc/${var.project_name}-${var.environment}/flow-logs"
-  retention_in_days = 7 # Short retention for lab (30-90 days in production)
+  retention_in_days = 7
+
   lifecycle {
-    create_before_destroy = true
+    # create_before_destroy REMOVED — it was causing the old group to survive
+    # because AWS doesn't allow two groups with the same name simultaneously.
+    # ignore_changes on name prevents replacement if name logic ever changes.
+    ignore_changes = [name]
   }
+
   tags = var.tags
 }
 
