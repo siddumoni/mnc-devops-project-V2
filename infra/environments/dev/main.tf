@@ -35,14 +35,16 @@ provider "aws" {
 }
 
 provider "kubernetes" {
-  host                   = try(module.dev.cluster_endpoint, "")
-  cluster_ca_certificate = base64decode(module.dev.cluster_ca_certificate)
-
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "aws"
-    args        = ["eks", "get-token", "--cluster-name", "mnc-app-dev-cluster", "--region", var.aws_region]
-  }
+  # IMPORTANT:
+  # Do not reference module outputs here. During `terraform import` (used by
+  # infra.ps1 to reattach the preserved Jenkins EBS volume), module outputs are
+  # not known yet, which makes provider configuration invalid and blocks import.
+  #
+  # Using kubeconfig keeps provider config static for init/import/plan, while
+  # Pass 2 still works after infra.ps1 runs:
+  #   aws eks update-kubeconfig --region <region> --name <cluster>
+  config_path    = "~/.kube/config"
+  config_context = "${var.project_name}-${var.environment}-cluster"
 }
 
 module "dev" {
