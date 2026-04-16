@@ -68,3 +68,9 @@ variable "acm_certificate_arn" {
   type    = string
   default = ""
 }
+
+
+variable "enable_kubernetes_resources" {
+  type    = bool
+  default = false
+}

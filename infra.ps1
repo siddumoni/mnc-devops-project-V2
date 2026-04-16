@@ -244,6 +244,7 @@ function Invoke-Pass2 {
         terraform apply `
             -var-file="terraform.tfvars" `
             -var="db_password=$DB_PASSWORD" `
+            -var="enable_kubernetes_resources=true" `
             -auto-approve
 
         if ($LASTEXITCODE -ne 0) { throw "Pass 2 terraform apply failed" }

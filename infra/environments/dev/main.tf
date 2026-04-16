@@ -34,17 +34,26 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_eks_cluster" "dev" {
+  count = var.enable_kubernetes_resources ? 1 : 0
+  name  = "${var.project_name}-${var.environment}-cluster"
+}
+
 provider "kubernetes" {
-  # IMPORTANT:
-  # Do not reference module outputs here. During `terraform import` (used by
-  # infra.ps1 to reattach the preserved Jenkins EBS volume), module outputs are
-  # not known yet, which makes provider configuration invalid and blocks import.
-  #
-  # Using kubeconfig keeps provider config static for init/import/plan, while
-  # Pass 2 still works after infra.ps1 runs:
-  #   aws eks update-kubeconfig --region <region> --name <cluster>
-  config_path    = "~/.kube/config"
-  config_context = "${var.project_name}-${var.environment}-cluster"
+ # Keep provider configuration import-safe:
+  # - Pass 1/import runs with enable_kubernetes_resources=false and uses a dummy
+  #   endpoint so Terraform can configure the provider without kubeconfig.
+  # - Pass 2 sets enable_kubernetes_resources=true, loads the real EKS endpoint
+  #   from data.aws_eks_cluster.dev, and uses aws eks get-token for auth.
+  host = var.enable_kubernetes_resources ? data.aws_eks_cluster.dev[0].endpoint : "https://127.0.0.1"
+
+  cluster_ca_certificate = var.enable_kubernetes_resources ? base64decode(data.aws_eks_cluster.dev[0].certificate_authority[0].data) : null
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", "${var.project_name}-${var.environment}-cluster", "--region", var.aws_region]
+  }
 }
 
 module "dev" {
@@ -72,6 +81,7 @@ module "dev" {
   db_instance_class     = var.db_instance_class
   db_storage            = var.db_storage
   acm_certificate_arn   = var.acm_certificate_arn
+  enable_kubernetes_resources = var.enable_kubernetes_resources
 }
 
 # ── Pass-through outputs ──────────────────────────────────────────────────

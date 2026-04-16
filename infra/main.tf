@@ -124,6 +124,8 @@ module "rds" {
 
 # Kubernetes namespace — created in Pass 2 (after EKS is healthy)
 resource "kubernetes_namespace" "env" {
+  count = var.enable_kubernetes_resources ? 1 : 0
+
   metadata {
     name = var.environment
     labels = {
