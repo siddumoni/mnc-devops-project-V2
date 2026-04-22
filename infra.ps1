@@ -358,7 +358,6 @@ function Invoke-K8sManifests {
     # Apply non-deployment manifests
     kubectl apply -f "$K8S_DIR\namespace.yaml"
     kubectl apply -f "$K8S_DIR\configmap.yaml"
-    kubectl apply -f "$K8S_DIR\secret.yaml"
     kubectl apply -f "$K8S_DIR\backend-service.yaml"
     kubectl apply -f "$K8S_DIR\frontend-service.yaml"
     kubectl apply -f "$K8S_DIR\ingress.yaml"
