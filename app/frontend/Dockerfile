@@ -5,7 +5,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --silent
+RUN npm install --silent
 ARG REACT_APP_API_URL
 ARG REACT_APP_ENV
 ARG GIT_COMMIT
