@@ -155,15 +155,6 @@ resource "aws_security_group" "nodes" {
     description = "Node-to-node communication"
   }
 
-  # Jenkins kubectl access to EKS API
-  ingress {
-  from_port   = 443
-  to_port     = 443
-  protocol    = "tcp"
-  cidr_blocks = ["10.10.0.0/16"]
-  description = "EKS API access from within VPC"
-}
-
   # ALB to backend pods
   ingress {
     from_port       = 8080
