@@ -214,6 +214,7 @@ aws eks update-kubeconfig \
   --name "$CLUSTER_NAME" \
   --kubeconfig "$JENKINS_HOME/.kube/config" || true
 chown -R jenkins:jenkins "$JENKINS_HOME/.kube" 2>/dev/null || true
+sed -i 's|command: aws$|command: /usr/bin/aws|g' "$JENKINS_HOME/.kube/config" || true
 
 # -- [10] Store public IP in SSM
 PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
