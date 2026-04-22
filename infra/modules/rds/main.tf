@@ -12,20 +12,12 @@ resource "aws_security_group" "rds" {
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    cidr_blocks     = ["10.10.0.0/16"]
-    description     = "MySQL from EKS pods"
-  }
-
-  ingress {
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    cidr_blocks     = ["10.10.0.0/16"]
-    description     = "MySQL from Jenkins (Flyway migrations)"
-  }
+  from_port   = 3306
+  to_port     = 3306
+  protocol    = "tcp"
+  cidr_blocks = ["10.10.0.0/16"]
+  description = "MySQL from within VPC"
+}
 
   tags = merge(var.tags, { Name = "${var.project_name}-${var.environment}-rds-sg" })
 }
