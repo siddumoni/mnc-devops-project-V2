@@ -281,7 +281,6 @@ def deployToEnvironment(String env, String imageTag) {
 
         # Apply all manifests
         kubectl apply -f k8s/${env}/configmap.yaml      --namespace=${env}
-        kubectl apply -f k8s/${env}/secret.yaml         --namespace=${env}
         kubectl apply -f k8s/${env}/backend-service.yaml  --namespace=${env}
         kubectl apply -f k8s/${env}/frontend-service.yaml --namespace=${env}
         kubectl apply -f k8s/${env}/ingress.yaml          --namespace=${env}
