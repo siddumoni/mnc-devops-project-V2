@@ -33,7 +33,7 @@ jenkins_ami_id        = "ami-0c95fa15b20f5400e" # patched by infra.ps1 bootstrap
 jenkins_instance_type = "t3.large"
 
 # ── EKS ───────────────────────────────────────────────────────────────────
-kubernetes_version  = "1.32"
+kubernetes_version  = "1.35"
 node_instance_types = ["t3.small"] # 2 vCPU, 2GB — smallest viable for app pods
 desired_nodes       = 1            # Start with 1, Cluster Autoscaler adds 2nd if needed
 min_nodes           = 1
