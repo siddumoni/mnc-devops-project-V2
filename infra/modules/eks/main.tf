@@ -53,6 +53,15 @@ resource "aws_eks_cluster" "main" {
   depends_on = [aws_iam_role_policy_attachment.cluster_policy]
 }
 
+resource "aws_vpc_security_group_ingress_rule" "cluster_api_from_vpc" {
+  security_group_id = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  cidr_ipv4         = "10.10.0.0/16"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  description       = "EKS API access from within VPC"
+}
+
 # ── OIDC Provider (enables IRSA — no static AWS keys in pods) ────────────
 data "tls_certificate" "cluster" {
   url = aws_eks_cluster.main.identity[0].oidc[0].issuer
@@ -153,7 +162,7 @@ resource "aws_security_group" "nodes" {
     protocol    = "-1"
     self        = true
     description = "Node-to-node communication"
-  }
+  } 
 
   # ALB to backend pods
   ingress {
