@@ -200,7 +200,7 @@ for i in $(seq 1 30); do
   if curl -sf http://localhost:9000/api/system/status | grep -q '"status":"UP"'; then
     PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
     curl -sf -u admin:admin -X POST "http://localhost:9000/api/webhooks/create" \
-      -d "name=jenkins&url=http://${PRIVATE_IP}:8080/sonarqube-webhook/" || true
+      -d "name=jenkins&url=http://$${PRIVATE_IP}:8080/sonarqube-webhook/" || true
     echo "SonarQube webhook created"
     break
   fi

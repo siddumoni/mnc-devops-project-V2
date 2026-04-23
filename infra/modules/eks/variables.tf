@@ -3,7 +3,7 @@ variable "environment" { type = string }
 variable "cluster_name" { type = string }
 variable "kubernetes_version" {
   type    = string
-  default = "1.32"
+  default = "1.35"
 }
 
 variable "vpc_id" {
