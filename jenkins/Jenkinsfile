@@ -155,7 +155,6 @@ pipeline {
                         echo "=== Building backend ==="
                         docker build \
                             -t ${BACKEND_REPO}:${imageTag} \
-                            -t ${BACKEND_REPO}:dev-latest \
                             --build-arg BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
                             --build-arg GIT_COMMIT=${GIT_COMMIT_SHORT} \
                             --build-arg VERSION=${imageTag} \
@@ -163,8 +162,7 @@ pipeline {
                             app/backend/
 
                         docker push ${BACKEND_REPO}:${imageTag}
-                        docker push ${BACKEND_REPO}:dev-latest
-                        docker rmi ${BACKEND_REPO}:${imageTag} ${BACKEND_REPO}:dev-latest || true
+                        docker rmi ${BACKEND_REPO}:${imageTag} || true
                     """
 
                     // Build and push frontend
@@ -172,15 +170,13 @@ pipeline {
                         echo "=== Building frontend ==="
                         docker build \
                             -t ${FRONTEND_REPO}:${imageTag} \
-                            -t ${FRONTEND_REPO}:dev-latest \
                             --build-arg REACT_APP_ENV=dev \
                             --build-arg GIT_COMMIT=${GIT_COMMIT_SHORT} \
                             -f app/frontend/Dockerfile \
                             app/frontend/
 
                         docker push ${FRONTEND_REPO}:${imageTag}
-                        docker push ${FRONTEND_REPO}:dev-latest
-                        docker rmi ${FRONTEND_REPO}:${imageTag} ${FRONTEND_REPO}:dev-latest || true
+                        docker rmi ${FRONTEND_REPO}:${imageTag} ${FRONTEND_REPO} || true
                     """
 
                     env.IMAGE_TAG = imageTag
