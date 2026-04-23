@@ -179,8 +179,8 @@ fi
 echo "=== [8] SonarQube ==="
 echo "vm.max_map_count=262144" >> /etc/sysctl.conf
 sysctl -w vm.max_map_count=262144
-mkdir -p /opt/sonarqube/{data,extensions,logs}
-chown -R 1000:1000 /opt/sonarqube
+mkdir -p "$JENKINS_HOME/sonarqube/"{data,extensions,logs}
+chown -R 1000:1000 "$JENKINS_HOME/sonarqube"
 docker stop sonarqube 2>/dev/null || true
 docker rm   sonarqube 2>/dev/null || true
 docker run -d \
@@ -188,9 +188,9 @@ docker run -d \
   --restart always \
   -p "$${SONARQUBE_PORT}":9000 \
   -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
-  -v /opt/sonarqube/data:/opt/sonarqube/data \
-  -v /opt/sonarqube/extensions:/opt/sonarqube/extensions \
-  -v /opt/sonarqube/logs:/opt/sonarqube/logs \
+  -v "$JENKINS_HOME/sonarqube/data:/opt/sonarqube/data" \
+  -v "$JENKINS_HOME/sonarqube/extensions:/opt/sonarqube/extensions" \
+  -v "$JENKINS_HOME/sonarqube/logs:/opt/sonarqube/logs" \
   sonarqube:community
 echo "SonarQube starting on port $${SONARQUBE_PORT}..."
 
