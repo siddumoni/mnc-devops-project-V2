@@ -517,19 +517,8 @@ function Invoke-Destroy {
 
     Write-Step "Pre-deleting CloudWatch Log Group (prevents recreate conflict)"
     $logGroupName = "/aws/vpc/$PROJECT_NAME-$ENVIRONMENT/flow-logs"
-    $lgCheck = aws logs describe-log-groups `
-        --log-group-name-prefix $logGroupName `
-        --region $AWS_REGION `
-        --query "logGroups[?logGroupName=='$logGroupName'].logGroupName" `
-        --output text 2>&1
-    if ($lgCheck -and $lgCheck.Trim() -eq $logGroupName) {
-        aws logs delete-log-group `
-            --log-group-name $logGroupName `
-            --region $AWS_REGION | Out-Null
-        Write-OK "CloudWatch Log Group deleted: $logGroupName"
-    } else {
-        Write-Info "CloudWatch Log Group not found — nothing to delete"
-    }
+    aws logs delete-log-group --log-group-name $logGroupName --region $AWS_REGION 2>&1 | Out-Null
+    Write-OK "CloudWatch Log Group deletion attempted: $logGroupName"
 
     # ── Step 2: Remove EBS volume from Terraform state ─────────────────────
     # This prevents terraform destroy from deleting the persistent EBS volume.
