@@ -195,13 +195,24 @@ docker run -d \
 echo "SonarQube starting on port $${SONARQUBE_PORT}..."
 
 # Auto-create Jenkins webhook in SonarQube
-echo "Waiting for SonarQube to be ready to create webhook..."
+
+# Docker bridge gateway — stable across all recreates, no IP lookup needed
+JENKINS_WEBHOOK_URL="http://172.17.0.1:8080/sonarqube-webhook/"
+
+echo "Waiting for SonarQube to register webhook..."
 for i in $(seq 1 30); do
   if curl -sf http://localhost:9000/api/system/status | grep -q '"status":"UP"'; then
-    PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+    # Delete any existing webhooks first (handles recreate case)
+    EXISTING=$(curl -s -u admin:admin http://localhost:9000/api/webhooks/list)
+    echo "$EXISTING" | grep -o '"key":"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' | while read key; do
+      curl -sf -u admin:admin -X POST "http://localhost:9000/api/webhooks/delete" \
+        -d "webhook=$key" || true
+    done
+    # Create with stable Docker bridge URL
     curl -sf -u admin:admin -X POST "http://localhost:9000/api/webhooks/create" \
-      -d "name=jenkins&url=http://$${PRIVATE_IP}:8080/sonarqube-webhook/" || true
-    echo "SonarQube webhook created"
+      -d "name=jenkins" \
+      -d "url=${JENKINS_WEBHOOK_URL}"
+    echo "SonarQube webhook set to: ${JENKINS_WEBHOOK_URL}"
     break
   fi
   echo "Waiting for SonarQube... ($i/30)"
