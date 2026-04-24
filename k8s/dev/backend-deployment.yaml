@@ -71,21 +71,22 @@ spec:
             httpGet:
               path: /actuator/health/readiness
               port: 8080
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: 8080
-            initialDelaySeconds: 60
+            initialDelaySeconds: 90
             periodSeconds: 15
             failureThreshold: 3
           startupProbe:
             httpGet:
               path: /actuator/health
               port: 8080
-            failureThreshold: 12
+            initialDelaySeconds: 45
+            failureThreshold: 20
             periodSeconds: 10
           securityContext:
             allowPrivilegeEscalation: false

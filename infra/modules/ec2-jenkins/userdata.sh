@@ -211,8 +211,8 @@ for i in $(seq 1 30); do
     # Create with stable Docker bridge URL
     curl -sf -u admin:admin -X POST "http://localhost:9000/api/webhooks/create" \
       -d "name=jenkins" \
-      -d "url=${JENKINS_WEBHOOK_URL}"
-    echo "SonarQube webhook set to: ${JENKINS_WEBHOOK_URL}"
+      -d "url=$${JENKINS_WEBHOOK_URL}"
+    echo "SonarQube webhook set to: $${JENKINS_WEBHOOK_URL}"
     break
   fi
   echo "Waiting for SonarQube... ($i/30)"

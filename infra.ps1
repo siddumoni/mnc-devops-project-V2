@@ -293,6 +293,66 @@ function Install-ALBController {
 function Install-ClusterAutoscaler {
     Write-Step "Installing Cluster Autoscaler"
 
+    # ── Step 1: Get the current OIDC provider URL from the live cluster ───
+    # This is always fresh — reads from the actual cluster, not Terraform state.
+    $OIDC_URL = aws eks describe-cluster `
+        --name $CLUSTER_NAME `
+        --region $AWS_REGION `
+        --query "cluster.identity.oidc.issuer" `
+        --output text
+    # Strip the https:// prefix — IAM trust policy needs it without scheme
+    $OIDC_HOST = $OIDC_URL -replace "https://", ""
+    Write-Info "OIDC provider: $OIDC_HOST"
+
+    # ── Step 2: Get account ID and build the role ARN ─────────────────────
+    $ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
+
+    # ── Step 3: Update the IAM role trust policy with the current OIDC URL ─
+    # The Terraform-created role exists but its trust policy has the OLD OIDC URL.
+    # We patch it here so it always matches the current cluster's OIDC provider.
+    $ROLE_NAME = "$PROJECT_NAME-$ENVIRONMENT-cluster-autoscaler-role"
+    $TRUST_POLICY = @{
+        Version   = "2012-10-17"
+        Statement = @(
+            @{
+                Effect    = "Allow"
+                Principal = @{ Federated = "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_HOST}" }
+                Action    = "sts:AssumeRoleWithWebIdentity"
+                Condition = @{
+                    StringEquals = @{
+                        "${OIDC_HOST}:sub" = "system:serviceaccount:kube-system:cluster-autoscaler"
+                        "${OIDC_HOST}:aud" = "sts.amazonaws.com"
+                    }
+                }
+            }
+        )
+    } | ConvertTo-Json -Depth 10 -Compress
+
+    # Check if role exists — create it if not, update trust policy if yes
+    $roleCheck = aws iam get-role --role-name $ROLE_NAME 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Info "Creating Cluster Autoscaler IAM role..."
+        aws iam create-role `
+            --role-name $ROLE_NAME `
+            --assume-role-policy-document $TRUST_POLICY | Out-Null
+
+        # Attach the autoscaler policy (already created by Terraform in eks module)
+        $POLICY_ARN = "arn:aws:iam::${ACCOUNT_ID}:policy/$PROJECT_NAME-$ENVIRONMENT-cluster-autoscaler"
+        aws iam attach-role-policy `
+            --role-name $ROLE_NAME `
+            --policy-arn $POLICY_ARN | Out-Null
+        Write-OK "IAM role created: $ROLE_NAME"
+    } else {
+        Write-Info "Updating trust policy on existing role: $ROLE_NAME"
+        aws iam update-assume-role-policy `
+            --role-name $ROLE_NAME `
+            --policy-document $TRUST_POLICY | Out-Null
+        Write-OK "Trust policy updated with current OIDC URL"
+    }
+
+    $ROLE_ARN = "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+
+    # ── Step 4: Install via Helm with the fresh role ARN ──────────────────
     helm repo add autoscaler https://kubernetes.github.io/autoscaler 2>&1 | Out-Null
     helm repo update | Out-Null
 
@@ -301,14 +361,17 @@ function Install-ClusterAutoscaler {
         --set autoDiscovery.clusterName=$CLUSTER_NAME `
         --set awsRegion=$AWS_REGION `
         --set rbac.serviceAccount.create=true `
+        --set rbac.serviceAccount.name=cluster-autoscaler `
+        --set "rbac.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ROLE_ARN" `
+        --set image.tag=v1.31.0 `
         --set extraArgs.balance-similar-node-groups=true `
         --set extraArgs.skip-nodes-with-system-pods=false `
         --set extraArgs.scale-down-delay-after-add="5m" `
         --set extraArgs.scale-down-unneeded-time="5m" `
         --wait `
-        --timeout 3m
+        --timeout 5m
 
-    Write-OK "Cluster Autoscaler installed (min=1, max=2 — scales automatically)"
+    Write-OK "Cluster Autoscaler installed with fresh IRSA role: $ROLE_ARN"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -516,9 +579,16 @@ function Invoke-Destroy {
     }
 
     Write-Step "Pre-deleting CloudWatch Log Group (prevents recreate conflict)"
-    $logGroupName = "/aws/vpc/$PROJECT_NAME-$ENVIRONMENT/flow-logs"
-    aws logs delete-log-group --log-group-name $logGroupName --region $AWS_REGION 2>&1 | Out-Null
-    Write-OK "CloudWatch Log Group deletion attempted: $logGroupName"
+$logGroupName = "/aws/vpc/$PROJECT_NAME-$ENVIRONMENT/flow-logs"
+
+Push-Location $ENV_DIR
+terraform state rm "module.dev.module.vpc.aws_cloudwatch_log_group.vpc_flow_logs" 2>&1 | Out-Null
+Pop-Location
+
+aws logs delete-log-group `
+    --log-group-name $logGroupName `
+    --region $AWS_REGION 2>&1 | Out-Null
+Write-OK "CloudWatch Log Group deleted and removed from state: $logGroupName"
 
     # ── Step 2: Remove EBS volume from Terraform state ─────────────────────
     # This prevents terraform destroy from deleting the persistent EBS volume.
@@ -548,7 +618,26 @@ function Invoke-Destroy {
     } finally {
         Pop-Location
     }
+    # ── Clean up manually created Cluster Autoscaler IAM role ─────────────
+    # This role is created by Install-ClusterAutoscaler outside of Terraform.
+    # Must be deleted before terraform destroy or the policy deletion will
+    # fail with DeleteConflict (policy still attached to this role).
+    Write-Step "Cleaning up Cluster Autoscaler IAM role"
+    $script:ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
+    $CA_ROLE_NAME  = "$PROJECT_NAME-$ENVIRONMENT-cluster-autoscaler-role"
+    $CA_POLICY_ARN = "arn:aws:iam::$($script:ACCOUNT_ID):policy/$PROJECT_NAME-$ENVIRONMENT-cluster-autoscaler"
 
+    $roleExists = aws iam get-role --role-name $CA_ROLE_NAME 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        aws iam detach-role-policy `
+            --role-name $CA_ROLE_NAME `
+            --policy-arn $CA_POLICY_ARN 2>&1 | Out-Null
+        aws iam delete-role `
+            --role-name $CA_ROLE_NAME 2>&1 | Out-Null
+        Write-OK "Cluster Autoscaler IAM role deleted: $CA_ROLE_NAME"
+    } else {
+        Write-Info "Cluster Autoscaler IAM role not found — skipping"
+    }
     # ── Step 3: Terraform destroy (ordered targets) ────────────────────────
     Write-Step "Running terraform destroy (ordered)"
     Push-Location $ENV_DIR
@@ -786,6 +875,25 @@ function Invoke-Create {
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Green
 
     Invoke-Bootstrap
+
+    $logGroupName = "/aws/vpc/$PROJECT_NAME-$ENVIRONMENT/flow-logs"
+Write-Info "Checking CloudWatch log group status before Terraform..."
+$waited = 0
+while ($waited -lt 90) {
+    $result = aws logs describe-log-groups `
+        --log-group-name-prefix $logGroupName `
+        --query "logGroups[?logGroupName=='$logGroupName'].logGroupName" `
+        --output text --region $AWS_REGION 2>&1
+    $exists = if ($result) { $result.ToString().Trim() } else { "" }
+    if ([string]::IsNullOrWhiteSpace($exists)) {
+        Write-OK "Log group clear — proceeding to Terraform"
+        break
+    }
+    Write-Info "Log group still propagating... ($waited/90s)"
+    Start-Sleep 10
+    $waited += 10
+}
+
     Invoke-Pass1
     Wait-ForEKS
     Invoke-Pass2
